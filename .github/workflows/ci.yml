@@ -20,6 +20,8 @@ jobs:
       - name: Install (with all cloud SDKs so the provider tests type-check/run)
         run: |
           python -m pip install --upgrade pip
+          # cogno-homeo is a runtime dep not yet on PyPI — install from git first.
+          pip install "cogno-homeo @ git+https://github.com/sudoers-ai/cogno-homeo.git"
           pip install -e ".[dev,llm]"
       - name: Lint (ruff)
         run: ruff check cogno_synapse tests examples
