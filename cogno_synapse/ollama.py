@@ -9,6 +9,7 @@ import httpx
 
 from cogno_synapse.base import LLMBackend, Embedder
 from cogno_synapse._math import cosine_similarity
+from cogno_synapse._obs import log_done, log_request, warn_if_retryable
 
 logger = logging.getLogger("cogno_synapse.ollama")
 
@@ -66,12 +67,16 @@ class OllamaBackend(LLMBackend):
         if options:
             payload["options"] = options
 
+        log_request(logger, "ollama", self.model, system, prompt)
         t0 = time.perf_counter()
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(self._endpoint, json=payload)
-        elapsed = (time.perf_counter() - t0) * 1000
 
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except Exception as exc:
+            warn_if_retryable(logger, "ollama", self.model, exc)
+            raise
         data = response.json()
 
         # Prefer `response`; fall back to `thinking` so a reasoning model that
@@ -81,10 +86,7 @@ class OllamaBackend(LLMBackend):
         tokens_in = data.get("prompt_eval_count", 0)
         tokens_out = data.get("eval_count", 0)
 
-        logger.debug(
-            "Ollama generate done: elapsed_ms=%.1f tokens_in=%d tokens_out=%d",
-            elapsed, tokens_in, tokens_out,
-        )
+        log_done(logger, "ollama", self.model, t0, tokens_in, tokens_out)
         return text, tokens_in, tokens_out
 
     async def is_available(self) -> bool:

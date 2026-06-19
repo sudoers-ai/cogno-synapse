@@ -16,6 +16,7 @@ import logging
 from cogno_synapse.errors import InvalidAPIKeyError
 from cogno_synapse.tool_parsing import parse_tool_calls_from_text
 from cogno_synapse.openai_backend import _openai_tool_call, _safe_close
+from cogno_synapse._obs import log_done, log_request, warn_if_retryable
 
 logger = logging.getLogger("cogno_synapse.groq")
 
@@ -63,19 +64,19 @@ class GroqBackend:
         }
         if self.temperature is not None:
             kwargs["temperature"] = self.temperature
+        log_request(logger, "groq", self.model, system, prompt)
         try:
             t0 = time.perf_counter()
             resp = await client.chat.completions.create(**kwargs)
             usage = resp.usage
-            logger.debug("generate done elapsed_ms=%.1f", (time.perf_counter() - t0) * 1000)
-            return (
-                resp.choices[0].message.content or "",
-                usage.prompt_tokens if usage else 0,
-                usage.completion_tokens if usage else 0,
-            )
+            tokens_in = usage.prompt_tokens if usage else 0
+            tokens_out = usage.completion_tokens if usage else 0
+            log_done(logger, "groq", self.model, t0, tokens_in, tokens_out)
+            return (resp.choices[0].message.content or "", tokens_in, tokens_out)
         except Exception as exc:
             if _is_auth_error(exc):
                 raise InvalidAPIKeyError(f"GROQ_API_KEY invalid/rejected (model={self.model}): {exc}") from exc
+            warn_if_retryable(logger, "groq", self.model, exc)
             raise
         finally:
             await _safe_close(client)

@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import os
 import json
+import time
 import logging
 
 from cogno_synapse.errors import InvalidAPIKeyError
 from cogno_synapse.tool_parsing import parse_tool_calls_from_text
+from cogno_synapse._obs import log_done, log_request, warn_if_retryable
 
 logger = logging.getLogger("cogno_synapse.gemini")
 
@@ -66,20 +68,22 @@ class GeminiBackend:
             config["temperature"] = self.temperature
         if system:
             config["system_instruction"] = system
+        log_request(logger, "gemini", self.model, system, prompt)
         try:
+            t0 = time.perf_counter()
             resp = await client.aio.models.generate_content(
                 model=self.model, contents=prompt, config=config)
             usage = getattr(resp, "usage_metadata", None)
-            return (
-                resp.text or "",
-                getattr(usage, "prompt_token_count", 0) if usage else 0,
-                getattr(usage, "candidates_token_count", 0) if usage else 0,
-            )
+            tokens_in = getattr(usage, "prompt_token_count", 0) if usage else 0
+            tokens_out = getattr(usage, "candidates_token_count", 0) if usage else 0
+            log_done(logger, "gemini", self.model, t0, tokens_in, tokens_out)
+            return (resp.text or "", tokens_in, tokens_out)
         except Exception as exc:
             if _is_auth_error(exc):
                 raise InvalidAPIKeyError(
                     f"GEMINI_API_KEY invalid/rejected (model={self.model}): {exc}"
                 ) from exc
+            warn_if_retryable(logger, "gemini", self.model, exc)
             raise
 
     async def chat_with_tools(self, messages, tools, tool_choice=None):

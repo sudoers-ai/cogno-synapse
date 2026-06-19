@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import os
 import json
+import time
 import logging
 
 from cogno_synapse.errors import InvalidAPIKeyError
 from cogno_synapse.tool_parsing import parse_tool_calls_from_text
+from cogno_synapse._obs import log_done, log_request, warn_if_retryable
 
 logger = logging.getLogger("cogno_synapse.anthropic")
 
@@ -65,16 +67,22 @@ class AnthropicBackend:
         }
         if self.temperature is not None:
             kwargs["temperature"] = self.temperature
+        log_request(logger, "anthropic", self.model, system, prompt)
         try:
+            t0 = time.perf_counter()
             resp = await client.messages.create(**kwargs)
             text = resp.content[0].text if resp.content else ""
             usage = resp.usage
-            return text, usage.input_tokens if usage else 0, usage.output_tokens if usage else 0
+            tokens_in = usage.input_tokens if usage else 0
+            tokens_out = usage.output_tokens if usage else 0
+            log_done(logger, "anthropic", self.model, t0, tokens_in, tokens_out)
+            return text, tokens_in, tokens_out
         except Exception as exc:
             if _is_auth_error(exc):
                 raise InvalidAPIKeyError(
                     f"ANTHROPIC_API_KEY invalid/rejected (model={self.model}): {exc}"
                 ) from exc
+            warn_if_retryable(logger, "anthropic", self.model, exc)
             raise
         finally:
             await _safe_close(client)
