@@ -31,3 +31,7 @@ jobs:
         # Integration tests against real provider APIs auto-skip without keys;
         # the unit suite mocks every SDK/HTTP client.
         run: pytest tests/unit -q --cov=cogno_synapse --cov-report=term-missing
+      - name: Integration tests (auto-skip without Ollama / cloud keys)
+        # No Ollama server or API keys in CI → every integration test skips, so
+        # this stays green; it runs for real locally (Ollama up) or with keys set.
+        run: pytest tests/integration -q
