@@ -50,6 +50,19 @@ def test_factory_openai_with_key(monkeypatch):
     assert isinstance(b, OpenAIBackend) and b.model == "gpt-4o-mini"
 
 
+def test_factory_byok_api_key_override(monkeypatch):
+    # an explicit api_key (the host's per-tenant BYOK key) is used WITHOUT any env var
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    b = create_backend("openai:gpt-4o-mini", api_key="sk-tenant-byok")
+    assert isinstance(b, OpenAIBackend) and b.api_key == "sk-tenant-byok"
+
+
+def test_factory_byok_key_for_openai_compatible(monkeypatch):
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    b = create_backend("deepseek:deepseek-chat", api_key="sk-tenant-ds")
+    assert isinstance(b, OpenAIBackend) and b.api_key == "sk-tenant-ds"
+
+
 # ── OpenAI-compatible providers (base_url, no new class) ──────────────
 
 def test_parse_model_string_openai_compatible():

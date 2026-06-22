@@ -67,6 +67,7 @@ def _key_present(provider: str) -> bool:
 def create_backend(
     model_string: str,
     *,
+    api_key: str | None = None,
     base_url: str = "http://localhost:11434",
     temperature: float | None = None,
     num_ctx: int | None = 8192,
@@ -75,34 +76,40 @@ def create_backend(
 ) -> LLMBackend:
     """Instantiate a single backend for ``model_string`` (e.g. "openai:gpt-4o-mini").
 
-    Raises ``MissingAPIKeyError`` if a cloud provider is requested without a
-    usable key (fail loudly, never silently degrade).
+    ``api_key`` overrides the env-var lookup — the host passes a per-tenant key (BYOK);
+    when None the provider falls back to its env var. Raises ``MissingAPIKeyError`` if a
+    cloud provider is requested with neither (fail loudly, never silently degrade).
     """
     provider, model = parse_model_string(model_string)
 
-    if (provider in _EXTERNAL or provider in _OPENAI_COMPATIBLE) and not _key_present(provider):
+    if (provider in _EXTERNAL or provider in _OPENAI_COMPATIBLE) \
+            and not api_key and not _key_present(provider):
         raise MissingAPIKeyError(
-            f"Model '{model_string}' needs {_key_env(provider)}, which is unset or a placeholder."
+            f"Model '{model_string}' needs {_key_env(provider)} or an explicit api_key."
         )
 
     if provider in _OPENAI_COMPATIBLE:
         url, env = _OPENAI_COMPATIBLE[provider]
         from cogno_synapse.openai_backend import OpenAIBackend
-        return OpenAIBackend(model=model, api_key=os.environ.get(env), base_url=url,
+        return OpenAIBackend(model=model, api_key=api_key or os.environ.get(env), base_url=url,
                              temperature=temperature, max_tokens=max_tokens, timeout=timeout)
 
     if provider == "openai":
         from cogno_synapse.openai_backend import OpenAIBackend
-        return OpenAIBackend(model=model, temperature=temperature, max_tokens=max_tokens, timeout=timeout)
+        return OpenAIBackend(model=model, api_key=api_key, temperature=temperature,
+                             max_tokens=max_tokens, timeout=timeout)
     if provider == "anthropic":
         from cogno_synapse.anthropic_backend import AnthropicBackend
-        return AnthropicBackend(model=model, temperature=temperature, max_tokens=max_tokens, timeout=timeout)
+        return AnthropicBackend(model=model, api_key=api_key, temperature=temperature,
+                                max_tokens=max_tokens, timeout=timeout)
     if provider == "groq":
         from cogno_synapse.groq_backend import GroqBackend
-        return GroqBackend(model=model, temperature=temperature, max_tokens=max_tokens, timeout=timeout)
+        return GroqBackend(model=model, api_key=api_key, temperature=temperature,
+                           max_tokens=max_tokens, timeout=timeout)
     if provider == "gemini":
         from cogno_synapse.gemini_backend import GeminiBackend
-        return GeminiBackend(model=model, temperature=temperature, max_tokens=max_tokens, timeout=timeout)
+        return GeminiBackend(model=model, api_key=api_key, temperature=temperature,
+                             max_tokens=max_tokens, timeout=timeout)
     if provider == "bedrock":
         from cogno_synapse.bedrock_backend import BedrockBackend
         return BedrockBackend(model=model, temperature=temperature, max_tokens=max_tokens, timeout=timeout)
