@@ -48,6 +48,21 @@ text, tin, tout = await chain.generate(system, prompt)
 
 This library is **transport only** — it produces raw token counts but does not price them (the host does), and it carries no business model-ladder/`_FALLBACK_MATRIX` (also host). Resilience is delegated to `cogno-homeo`; cognition lives in `cogno-anima`.
 
+## The Cogno ecosystem
+
+`cogno-synapse` is one organ of **[Cogno](https://github.com/sudoers-ai)** — a family of
+small, composable, Apache-2.0 libraries that together form a complete
+conversational-agent platform. Each library owns a single concern and stays
+infra-agnostic; a **host** assembles them into a running agent:
+
+![The Cogno ecosystem](docs/assets/cogno-ecosystem.svg)
+
+The open-source libraries are the organs; the **host is the body** that joins
+them. Our reference host — `cogno-host`, with its `cogno-ui` dashboard — is the
+private product layer, but it holds no special powers: everything it does rides
+on the public seams documented in each library's `docs/HOST_INTEGRATION.md`, so
+you can assemble a body of your own.
+
 ## Test
 
 ```bash
