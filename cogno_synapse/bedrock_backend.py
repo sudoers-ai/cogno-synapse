@@ -93,7 +93,10 @@ class BedrockBackend:
         try:
             t0 = time.perf_counter()
             resp = await loop.run_in_executor(None, _call)
-            text = resp["output"]["message"]["content"][0]["text"]
+            # First text block, not content[0]: reasoning models (Claude 3.7 thinking) emit a
+            # leading reasoningContent block, so [0]["text"] would KeyError on the answer.
+            _content = resp["output"]["message"].get("content", [])
+            text = next((b["text"] for b in _content if "text" in b), "")
             usage = resp.get("usage", {})
             tokens_in = usage.get("inputTokens", 0)
             tokens_out = usage.get("outputTokens", 0)
@@ -165,8 +168,21 @@ class BedrockBackend:
             if role == "system":
                 system_text = msg.get("content", "")
                 continue
+            if role == "tool":
+                tr = {"toolResult": {"toolUseId": msg.get("tool_call_id", ""),
+                                     "content": [{"text": msg.get("content", "")}],
+                                     "status": "success"}}
+                # Coalesce consecutive tool results into ONE user turn: parallel tool_calls feed
+                # back as multiple `tool` messages, and Bedrock's Converse rejects consecutive
+                # same-role turns (400) — they must share a single user message's content list.
+                if (out and out[-1]["role"] == "user"
+                        and all("toolResult" in b for b in out[-1]["content"])):
+                    out[-1]["content"].append(tr)
+                else:
+                    out.append({"role": "user", "content": [tr]})
+                continue
             blocks = []
-            if msg.get("content") and role != "tool":
+            if msg.get("content"):
                 blocks.append({"text": msg["content"]})
             if role == "assistant" and msg.get("tool_calls"):
                 for tc in msg["tool_calls"]:
@@ -178,11 +194,6 @@ class BedrockBackend:
                         parsed = {}
                     blocks.append({"toolUse": {"toolUseId": tc.get("id", ""),
                                                "name": func.get("name", ""), "input": parsed}})
-            if role == "tool":
-                blocks.append({"toolResult": {"toolUseId": msg.get("tool_call_id", ""),
-                                              "content": [{"text": msg.get("content", "")}],
-                                              "status": "success"}})
-                role = "user"
             if blocks:
                 out.append({"role": "assistant" if role == "assistant" else "user", "content": blocks})
         return system_text, out

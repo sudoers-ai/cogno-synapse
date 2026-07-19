@@ -372,3 +372,83 @@ def test_all_providers_support_native_tools():
     assert GroqBackend(model="m", api_key="k").supports_native_tools() is True
     assert GeminiBackend(model="m", api_key="k").supports_native_tools() is True
     assert BedrockBackend(model="m").supports_native_tools() is True
+
+
+# ════════════════ production-readiness sweep regressions ════════════════
+
+@pytest.mark.asyncio
+async def test_anthropic_generate_skips_leading_thinking_block(monkeypatch):
+    # extended-thinking models emit a `thinking` block before the text → content[0] would crash
+    b = AnthropicBackend(model="m", api_key="k")
+    resp = _Box(content=[_Box(type="thinking", text=None), _Box(type="text", text="answer")],
+                usage=_Box(input_tokens=1, output_tokens=1))
+    monkeypatch.setattr(b, "_client", lambda: FakeAnthropicClient(lambda **kw: resp))
+    assert (await b.generate("s", "p"))[0] == "answer"
+
+
+def test_anthropic_convert_coalesces_parallel_tool_results():
+    # parallel tool_calls feed back as consecutive `tool` messages; Anthropic rejects consecutive
+    # same-role turns → they must share ONE user message's content list.
+    _, conv = AnthropicBackend._convert_messages([
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "t1", "function": {"name": "a", "arguments": "{}"}},
+            {"id": "t2", "function": {"name": "b", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "t1", "content": "r1"},
+        {"role": "tool", "tool_call_id": "t2", "content": "r2"},
+    ])
+    users = [m for m in conv if m["role"] == "user"]
+    assert len(users) == 1
+    assert [blk["tool_use_id"] for blk in users[0]["content"]] == ["t1", "t2"]
+
+
+def test_bedrock_convert_coalesces_parallel_tool_results():
+    _, conv = BedrockBackend._convert_messages([
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "t1", "function": {"name": "a", "arguments": "{}"}},
+            {"id": "t2", "function": {"name": "b", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "t1", "content": "r1"},
+        {"role": "tool", "tool_call_id": "t2", "content": "r2"},
+    ])
+    users = [m for m in conv if m["role"] == "user"]
+    assert len(users) == 1
+    assert [blk["toolResult"]["toolUseId"] for blk in users[0]["content"]] == ["t1", "t2"]
+
+
+def test_gemini_tool_result_carries_originating_function_name():
+    # Gemini correlates a FunctionResponse to its call BY NAME — a constant "tool_result" breaks
+    # multi-turn grounding. The tool result must echo the originating call's function name.
+    class _FakeTypes:
+        Content = staticmethod(lambda **kw: _Box(**kw))
+        Part = staticmethod(lambda **kw: _Box(**kw))
+        FunctionResponse = staticmethod(lambda **kw: _Box(**kw))
+        FunctionCall = staticmethod(lambda **kw: _Box(**kw))
+    _, contents = GeminiBackend._convert_messages([
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_1", "function": {"name": "get_balance", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "42"},
+    ], _FakeTypes)
+    fr = contents[-1].parts[0].function_response
+    assert fr.name == "get_balance"      # not the constant "tool_result"
+
+
+def test_gemini_nested_tool_args_serialize_without_error():
+    # dict(fc.args) only shallow-converts proto MapComposite; the default= hook must deep-convert
+    # nested containers so json.dumps doesn't raise TypeError.
+    import json as _json
+
+    from cogno_synapse.gemini_backend import _proto_to_plain
+
+    class _Composite:
+        """A proto-MapComposite stand-in: a mapping json.dumps CANNOT serialize on its own."""
+        def __init__(self, d):
+            self._d = dict(d)
+        def keys(self):
+            return self._d.keys()
+        def __getitem__(self, k):
+            return self._d[k]
+        def items(self):
+            return self._d.items()
+
+    nested = _Composite({"slot": _Composite({"day": "fri"})})
+    dumped = _json.dumps(dict(nested), default=_proto_to_plain)   # mirrors the backend call
+    assert _json.loads(dumped) == {"slot": {"day": "fri"}}
