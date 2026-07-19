@@ -71,7 +71,10 @@ class AnthropicBackend:
         try:
             t0 = time.perf_counter()
             resp = await client.messages.create(**kwargs)
-            text = resp.content[0].text if resp.content else ""
+            # First TEXT block, not content[0]: extended-thinking models emit a leading
+            # ``thinking`` block, so indexing [0] would AttributeError on the answer.
+            text = next((b.text for b in (resp.content or [])
+                         if getattr(b, "type", None) == "text"), "")
             usage = resp.usage
             tokens_in = usage.input_tokens if usage else 0
             tokens_out = usage.output_tokens if usage else 0
@@ -147,9 +150,15 @@ class AnthropicBackend:
             if role == "system":
                 system_text = msg.get("content", "")
             elif role == "tool":
-                out.append({"role": "user", "content": [{
-                    "type": "tool_result", "tool_use_id": msg.get("tool_call_id", ""),
-                    "content": msg.get("content", "")}]})
+                block = {"type": "tool_result", "tool_use_id": msg.get("tool_call_id", ""),
+                         "content": msg.get("content", "")}
+                # Coalesce consecutive tool results into ONE user message: parallel tool_calls
+                # feed back as multiple `tool` messages, and Anthropic rejects consecutive
+                # same-role turns (400) — they must share a single user turn's content list.
+                if out and out[-1]["role"] == "user" and isinstance(out[-1]["content"], list):
+                    out[-1]["content"].append(block)
+                else:
+                    out.append({"role": "user", "content": [block]})
             elif role == "assistant" and msg.get("tool_calls"):
                 blocks = []
                 if msg.get("content"):

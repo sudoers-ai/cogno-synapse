@@ -22,6 +22,17 @@ from cogno_synapse._obs import log_done, log_request, warn_if_retryable
 logger = logging.getLogger("cogno_synapse.gemini")
 
 
+def _proto_to_plain(obj):
+    """``json.dumps(default=...)`` hook: deep-convert google-genai proto containers
+    (``MapComposite`` → dict, ``RepeatedComposite`` → list) that ``dict()`` leaves nested."""
+    if hasattr(obj, "items"):
+        return dict(obj)
+    try:
+        return list(obj)
+    except TypeError:
+        return str(obj)
+
+
 def _is_auth_error(exc: Exception) -> bool:
     if type(exc).__name__ in ("AuthenticationError", "PermissionDenied", "Unauthenticated"):
         return True
@@ -134,7 +145,11 @@ class GeminiBackend:
                         tool_calls.append({
                             "id": f"call_{i}", "type": "function",
                             "function": {"name": fc.name,
-                                         "arguments": json.dumps(dict(fc.args) if fc.args else {})},
+                                         # default= deep-converts nested proto (MapComposite/
+                                         # RepeatedComposite) values that dict() only shallow-copies,
+                                         # else json.dumps raises TypeError on nested args.
+                                         "arguments": json.dumps(dict(fc.args) if fc.args else {},
+                                                                 default=_proto_to_plain)},
                         })
             if tool_calls:
                 result["tool_calls"] = tool_calls
@@ -142,9 +157,11 @@ class GeminiBackend:
                 rescued = parse_tool_calls_from_text(result["content"], tools)
                 if rescued:
                     result["tool_calls"] = rescued
+            # Coerce token counts: Gemini returns None for these on blocked/partial responses,
+            # which would poison StageMetrics arithmetic downstream.
             return (result,
-                    getattr(usage, "prompt_token_count", 0) if usage else 0,
-                    getattr(usage, "candidates_token_count", 0) if usage else 0)
+                    int(getattr(usage, "prompt_token_count", 0) or 0) if usage else 0,
+                    int(getattr(usage, "candidates_token_count", 0) or 0) if usage else 0)
         except Exception as exc:
             if _is_auth_error(exc):
                 raise InvalidAPIKeyError(
@@ -156,14 +173,23 @@ class GeminiBackend:
     def _convert_messages(messages, types):
         system_text = ""
         contents = []
+        # Gemini correlates a FunctionResponse to its call BY NAME, so a tool result must carry
+        # the originating function's name (not a constant "tool_result", which breaks multi-turn
+        # grounding — the model re-issues or ignores the call). Map tool_call_id → function name.
+        id_to_name: dict = {}
+        for m in messages:
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                for tc in m["tool_calls"]:
+                    id_to_name[tc.get("id", "")] = tc.get("function", {}).get("name", "")
         for msg in messages:
             role = msg.get("role", "user")
             if role == "system":
                 system_text = msg.get("content", "")
             elif role == "tool":
+                fn_name = id_to_name.get(msg.get("tool_call_id", ""), "") or "tool_result"
                 contents.append(types.Content(role="user", parts=[types.Part(
                     function_response=types.FunctionResponse(
-                        name="tool_result", response={"result": msg.get("content", "")}))]))
+                        name=fn_name, response={"result": msg.get("content", "")}))]))
             elif role == "assistant" and msg.get("tool_calls"):
                 parts = []
                 for tc in msg["tool_calls"]:
