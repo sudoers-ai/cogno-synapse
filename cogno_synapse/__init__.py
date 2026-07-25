@@ -13,6 +13,15 @@ backends are optional extras (lazy-imported SDKs). Resilience (breaker/retry/
 metrics) is delegated to cogno-homeo.
 """
 
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _dist_version
+
+try:
+    __version__ = _dist_version("cogno-synapse")
+except PackageNotFoundError:  # source tree without an installed dist (e.g. vendored checkout)
+    __version__ = "0.0.0"
+
+
 from cogno_synapse.base import LLMBackend, ToolCallingBackend, Embedder
 from cogno_synapse.ollama import OllamaBackend, OllamaEmbedder
 from cogno_synapse.cache import CachingEmbedder, EmbeddingUsage
