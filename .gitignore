@@ -75,3 +75,4 @@ venv.bak/
 # Logs
 *.log
 logs/
+dist/

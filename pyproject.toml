@@ -24,7 +24,7 @@ classifiers = [
 # Core (protocols + Ollama + OpenAI-compatible HTTP backends + fallback) needs
 # only httpx; resilience (breaker/retry/metrics) comes from cogno-homeo. Cloud
 # provider SDKs are lazy-imported behind the optional extras below.
-dependencies = ["httpx>=0.20.0", "cogno-homeo"]
+dependencies = ["httpx>=0.20.0", "cogno-homeo>=0.1,<0.2"]
 
 [project.urls]
 Homepage = "https://github.com/sudoers-ai/cogno-synapse"
