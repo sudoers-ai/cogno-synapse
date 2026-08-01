@@ -27,12 +27,15 @@ from cogno_synapse.ollama import OllamaBackend, OllamaEmbedder
 from cogno_synapse.cache import CachingEmbedder, EmbeddingUsage
 from cogno_synapse.tool_parsing import parse_tool_calls_from_text
 from cogno_synapse.openai_backend import OpenAIBackend
+from cogno_synapse.openai_embedder import OpenAIEmbedder
+from cogno_synapse.gemini_embedder import GeminiEmbedder
+from cogno_synapse.bedrock_embedder import BedrockEmbedder
 from cogno_synapse.anthropic_backend import AnthropicBackend
 from cogno_synapse.groq_backend import GroqBackend
 from cogno_synapse.gemini_backend import GeminiBackend
 from cogno_synapse.bedrock_backend import BedrockBackend
 from cogno_synapse.fallback import FallbackBackend
-from cogno_synapse.factory import create_backend, parse_model_string
+from cogno_synapse.factory import create_backend, create_embedder, parse_model_string
 from cogno_synapse.errors import SynapseError, MissingAPIKeyError, InvalidAPIKeyError
 
 __all__ = [
@@ -45,12 +48,16 @@ __all__ = [
     "EmbeddingUsage",
     "parse_tool_calls_from_text",
     "OpenAIBackend",
+    "OpenAIEmbedder",
+    "GeminiEmbedder",
+    "BedrockEmbedder",
     "AnthropicBackend",
     "GroqBackend",
     "GeminiBackend",
     "BedrockBackend",
     "FallbackBackend",
     "create_backend",
+    "create_embedder",
     "parse_model_string",
     "SynapseError",
     "MissingAPIKeyError",

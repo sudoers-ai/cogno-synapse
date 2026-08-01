@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 
 from cogno_synapse.errors import MissingAPIKeyError
-from cogno_synapse.base import LLMBackend
+from cogno_synapse.base import Embedder, LLMBackend
 
 _EXTERNAL = {"openai", "anthropic", "groq", "gemini", "bedrock"}
 _KEY_ENV = {
@@ -117,3 +117,61 @@ def create_backend(
     from cogno_synapse.ollama import OllamaBackend
     return OllamaBackend(model=model, base_url=base_url, temperature=temperature,
                          num_ctx=num_ctx, max_tokens=max_tokens, timeout=timeout)
+
+
+def create_embedder(
+    model_string: str,
+    *,
+    api_key: str | None = None,
+    base_url: str = "http://localhost:11434",
+    dimensions: int | None = None,
+    timeout: int = 120,
+) -> "Embedder":
+    """Instantiate an ``Embedder`` for ``model_string`` (e.g. "openai:text-embedding-3-small").
+
+    Mirrors :func:`create_backend` — same ``provider:model`` grammar, same loud failure on a
+    cloud provider with no key — for the OTHER protocol. Bare/unknown prefix → Ollama.
+
+    ``dimensions`` is the vector width the STORE was built for (pgvector columns are fixed
+    width). Providers that support a shortened output honour it; Ollama ignores it, since a
+    local model's width is a property of the model.
+
+    Deliberately returns ONE embedder, never a fallback chain: failing over mid-write mixes
+    embedding spaces in a single column, and cosine across spaces is meaningless while still
+    returning a plausible number. Fail loudly instead — see ``openai_embedder`` for the note.
+    """
+    provider, model = parse_model_string(model_string)
+
+    if (provider in _EXTERNAL or provider in _OPENAI_COMPATIBLE) \
+            and not api_key and not _key_present(provider):
+        raise MissingAPIKeyError(
+            f"Embedding model '{model_string}' needs {_key_env(provider)} or an explicit api_key."
+        )
+
+    if provider == "openai" or provider in _OPENAI_COMPATIBLE:
+        url = _OPENAI_COMPATIBLE[provider][0] if provider in _OPENAI_COMPATIBLE else None
+        env = _OPENAI_COMPATIBLE[provider][1] if provider in _OPENAI_COMPATIBLE else "OPENAI_API_KEY"
+        from cogno_synapse.openai_embedder import OpenAIEmbedder
+        return OpenAIEmbedder(model=model, api_key=api_key or os.environ.get(env),
+                              dimensions=dimensions, timeout=timeout, base_url=url)
+
+    if provider == "gemini":
+        from cogno_synapse.gemini_embedder import GeminiEmbedder
+        return GeminiEmbedder(model=model, api_key=api_key, dimensions=dimensions,
+                              timeout=timeout)
+
+    if provider == "bedrock":
+        from cogno_synapse.bedrock_embedder import BedrockEmbedder
+        return BedrockEmbedder(model=model, dimensions=dimensions, timeout=timeout)
+
+    if provider in _EXTERNAL:
+        # anthropic and groq publish no embedding endpoint. Say so instead of silently handing
+        # back a local Ollama one — a wrong-provider embedder is a corrupt vector store, not a
+        # degraded feature.
+        raise NotImplementedError(
+            f"Provider '{provider}' has no embedding endpoint. "
+            f"Supported: openai (+ OpenAI-compatible), gemini, bedrock, ollama."
+        )
+
+    from cogno_synapse.ollama import OllamaEmbedder
+    return OllamaEmbedder(model=model, base_url=base_url, timeout=timeout)
