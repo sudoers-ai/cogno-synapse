@@ -118,9 +118,15 @@ class OpenAIEmbedder:
                 raise InvalidAPIKeyError(f"OpenAI rejected the API key: {exc}") from exc
             raise
 
+        # Map by the response's own ``index`` rather than by arrival order. The API documents
+        # input order, but pairing a vector with the WRONG text is exactly the silent failure
+        # this module exists to avoid — a mis-paired embedding corrupts recall with no error.
         out: list[list[float]] = [[] for _ in texts]
-        for (idx, _), item in zip(wanted, resp.data):
-            out[idx] = list(item.embedding)
+        for item in resp.data:
+            pos = getattr(item, "index", None)
+            idx = wanted[pos][0] if pos is not None and pos < len(wanted) else None
+            if idx is not None:
+                out[idx] = list(item.embedding)
         tokens = int(getattr(getattr(resp, "usage", None), "prompt_tokens", 0) or 0)
         return out, tokens
 

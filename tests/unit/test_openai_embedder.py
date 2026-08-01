@@ -9,23 +9,27 @@ from cogno_synapse.errors import MissingAPIKeyError
 class _FakeEmbeddings:
     """Stands in for ``client.embeddings``; records the params it was called with."""
 
-    def __init__(self, sink, dim=3):
+    def __init__(self, sink, dim=3, shuffled=False):
         self._sink = sink
         self._dim = dim
+        self._shuffled = shuffled
 
     async def create(self, **params):
         self._sink.update(params)
         n = len(params["input"])
         # Non-parallel vectors, so a cosine over a pair is a real value rather than 1.0.
-        data = [type("E", (), {"embedding": [1.0] + [0.0] * i + [1.0] * (self._dim - 1 - i)})()
+        data = [type("E", (), {"index": i,
+                               "embedding": [1.0] + [0.0] * i + [1.0] * (self._dim - 1 - i)})()
                 for i in range(n)]
+        if self._shuffled:                     # the API documents input order; don't rely on it
+            data.reverse()
         usage = type("U", (), {"prompt_tokens": 7 * n})()
         return type("R", (), {"data": data, "usage": usage})()
 
 
-def _embedder(sink, **kw):
+def _embedder(sink, shuffled=False, **kw):
     e = OpenAIEmbedder(api_key="sk-test", **kw)
-    e._client = type("C", (), {"embeddings": _FakeEmbeddings(sink)})()
+    e._client = type("C", (), {"embeddings": _FakeEmbeddings(sink, shuffled=shuffled)})()
     return e
 
 
@@ -67,6 +71,16 @@ async def test_batch_preserves_order_and_keeps_empties_in_place():
     assert sink["input"] == ["a", "b"]       # the empty is never sent…
     assert vecs[1] == []                     # …but still occupies its slot
     assert vecs[0] and vecs[2]
+
+
+@pytest.mark.asyncio
+async def test_out_of_order_response_is_mapped_by_index():
+    """Pairing a vector with the WRONG text corrupts recall silently, so map on the
+    response's own `index` rather than trusting arrival order."""
+    sink = {}
+    vecs = await _embedder(sink, shuffled=True).embed_batch(["a", "b", "c"])
+    straight = await _embedder({}).embed_batch(["a", "b", "c"])
+    assert vecs == straight
 
 
 @pytest.mark.asyncio
