@@ -117,3 +117,37 @@ def test_create_embedder_refuses_provider_without_an_implementation(monkeypatch)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
     with pytest.raises(NotImplementedError):
         create_embedder("anthropic:whatever")
+
+
+# ── CachingEmbedder must not hide the batch path ───────────────────────────────
+
+@pytest.mark.asyncio
+async def test_caching_wrapper_exposes_batch_and_only_sends_misses():
+    """Every consumer gets a WRAPPED embedder, so a wrapper without embed_batch makes
+    the inner batch path unreachable — the exact 'implemented but not wired' trap."""
+    from cogno_synapse import CachingEmbedder
+
+    sink = {}
+    wrapped = CachingEmbedder(_embedder(sink))
+    await wrapped.embed("a")                       # warms the cache for "a"
+    sink.clear()
+
+    vecs = await wrapped.embed_batch(["a", "b"])
+    assert sink["input"] == ["b"]                  # the cached one is not re-sent
+    assert len(vecs) == 2 and vecs[0] and vecs[1]
+    assert wrapped.usage.cache_hits == 1
+
+
+@pytest.mark.asyncio
+async def test_caching_batch_degrades_for_an_inner_without_batch():
+    """Ollama has no embed_batch — the wrapper must still answer, not raise."""
+    from cogno_synapse import CachingEmbedder
+
+    class _Single:
+        model = "x"
+
+        async def embed_with_usage(self, text):
+            return [float(len(text))], 1
+
+    vecs, tokens = await CachingEmbedder(_Single()).embed_batch_with_usage(["a", "bb"])
+    assert vecs == [[1.0], [2.0]] and tokens == 2

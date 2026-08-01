@@ -96,6 +96,59 @@ class CachingEmbedder(Embedder):
                 self._cache.popitem(last=False)  # evict least-recently-used
         return vec, tokens
 
+    async def embed_batch(self, texts: "list[str]") -> "list[list[float]]":
+        vecs, _ = await self.embed_batch_with_usage(texts)
+        return vecs
+
+    async def embed_batch_with_usage(self, texts: "list[str]") -> "tuple[list[list[float]], int]":
+        """Cache-aware batch: only the misses go to the provider, in ONE request.
+
+        Without this the wrapper would hide the inner ``embed_batch`` entirely — every
+        consumer of a wrapped embedder (which is all of them, since the cache is applied
+        by composition) would silently fall back to N sequential calls. That matters most
+        for the re-embedding path, whose whole point is rewriting a store in bulk.
+
+        An inner without ``embed_batch`` (e.g. Ollama) degrades to concurrent single
+        calls, so this is safe for every implementation.
+        """
+        if not texts:
+            return [], 0
+        out: "list[list[float]]" = [[] for _ in texts]
+        misses: "list[tuple[int, str]]" = []
+        for i, text in enumerate(texts):
+            if not text:
+                continue
+            key = text.strip().lower()
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                self._usage.cache_hits += 1
+                out[i] = self._cache[key]
+            else:
+                misses.append((i, text))
+        if not misses:
+            return out, 0
+
+        inner_batch = getattr(self._inner, "embed_batch_with_usage", None)
+        if inner_batch is None:
+            results = await asyncio.gather(*(self._inner_embed_usage(t) for _, t in misses))
+            vecs = [v for v, _ in results]
+            tokens = sum(t for _, t in results)
+            self._usage.calls += len(misses)
+        else:
+            vecs, tokens = await inner_batch([t for _, t in misses])
+            self._usage.calls += 1
+        self._usage.tokens += tokens
+
+        for (i, text), vec in zip(misses, vecs):
+            out[i] = vec
+            if vec and self._cache_size > 0:
+                key = text.strip().lower()
+                self._cache[key] = vec
+                self._cache.move_to_end(key)
+                while len(self._cache) > self._cache_size:
+                    self._cache.popitem(last=False)
+        return out, tokens
+
     async def similarity(self, a: str, b: str) -> float:
         sim, _ = await self.similarity_with_usage(a, b)
         return sim
