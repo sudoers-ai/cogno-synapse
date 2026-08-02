@@ -1,6 +1,6 @@
 [project]
 name = "cogno-synapse"
-version = "0.1.0"
+version = "0.1.1"
 description = "Model-transport layer for the Cogno cognitive pipeline — LLM + embedding backend protocols, Ollama + cloud backends, a single-backend factory, and a resilient fallback chain"
 readme = "README.md"
 requires-python = ">=3.10"
