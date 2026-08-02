@@ -149,3 +149,27 @@ def test_create_embedder_gemini_without_key_raises(monkeypatch):
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     with pytest.raises(MissingAPIKeyError):
         create_embedder("gemini:text-embedding-004")
+
+
+# ── the supported set is closed on purpose ────────────────────────────────────
+
+@pytest.mark.parametrize("spec", [
+    "deepseek:whatever", "xai:whatever", "openrouter:whatever",
+    "together:whatever", "fireworks:whatever", "moonshot:whatever",
+])
+def test_openai_compatible_prefixes_are_refused_for_embeddings(spec, monkeypatch):
+    """Sharing /chat/completions says NOTHING about /embeddings. Routing these to
+    OpenAIEmbedder would construct fine and 404 on the first turn — and the host's boot
+    guard fails open on transport errors, so that 404 would be swallowed as 'provider
+    down' and surface as a dead turn later."""
+    for env in ("DEEPSEEK_API_KEY", "XAI_API_KEY", "OPENROUTER_API_KEY",
+                "TOGETHER_API_KEY", "FIREWORKS_API_KEY", "MOONSHOT_API_KEY"):
+        monkeypatch.setenv(env, "k")
+    with pytest.raises(NotImplementedError):
+        create_embedder(spec)
+
+
+def test_the_error_names_the_supported_providers(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "k")
+    with pytest.raises(NotImplementedError, match="ollama, openai, gemini, bedrock"):
+        create_embedder("deepseek:whatever")
