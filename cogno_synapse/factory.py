@@ -148,12 +148,10 @@ def create_embedder(
             f"Embedding model '{model_string}' needs {_key_env(provider)} or an explicit api_key."
         )
 
-    if provider == "openai" or provider in _OPENAI_COMPATIBLE:
-        url = _OPENAI_COMPATIBLE[provider][0] if provider in _OPENAI_COMPATIBLE else None
-        env = _OPENAI_COMPATIBLE[provider][1] if provider in _OPENAI_COMPATIBLE else "OPENAI_API_KEY"
+    if provider == "openai":
         from cogno_synapse.openai_embedder import OpenAIEmbedder
-        return OpenAIEmbedder(model=model, api_key=api_key or os.environ.get(env),
-                              dimensions=dimensions, timeout=timeout, base_url=url)
+        return OpenAIEmbedder(model=model, api_key=api_key, dimensions=dimensions,
+                              timeout=timeout)
 
     if provider == "gemini":
         from cogno_synapse.gemini_embedder import GeminiEmbedder
@@ -164,13 +162,16 @@ def create_embedder(
         from cogno_synapse.bedrock_embedder import BedrockEmbedder
         return BedrockEmbedder(model=model, dimensions=dimensions, timeout=timeout)
 
-    if provider in _EXTERNAL:
-        # anthropic and groq publish no embedding endpoint. Say so instead of silently handing
-        # back a local Ollama one — a wrong-provider embedder is a corrupt vector store, not a
-        # degraded feature.
+    if provider in _EXTERNAL or provider in _OPENAI_COMPATIBLE:
+        # Everything else is refused AT CONSTRUCTION rather than routed hopefully. anthropic and
+        # groq publish no embedding endpoint at all. The OpenAI-COMPATIBLE prefixes are the
+        # subtler case: sharing /chat/completions says nothing about /embeddings, and several
+        # (deepseek, xai, openrouter) do not serve it — routing them here would build fine and
+        # 404 on the first turn instead. A wrong-provider embedder is a corrupt vector store,
+        # not a degraded feature, so the failure belongs here where it is obvious.
         raise NotImplementedError(
-            f"Provider '{provider}' has no embedding endpoint. "
-            f"Supported: openai (+ OpenAI-compatible), gemini, bedrock, ollama."
+            f"No embedding backend for provider '{provider}'. "
+            f"Supported: ollama, openai, gemini, bedrock."
         )
 
     from cogno_synapse.ollama import OllamaEmbedder
