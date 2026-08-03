@@ -22,6 +22,16 @@ class MissingAPIKeyError(SynapseError):
     """
 
 
+class EmbeddingResponseError(SynapseError):
+    """An embedding provider answered, but the response could not be mapped to the inputs.
+
+    Its own error class because the failure mode is unique among transport errors: nothing
+    raises, the call "succeeds", and the caller receives empty vectors it cannot distinguish
+    from a legitimately-empty input string. Written to a store, those become permanent silent
+    corruption of recall — so this refuses instead of returning them.
+    """
+
+
 class InvalidAPIKeyError(SynapseError):
     """A cloud API rejected the provided key at runtime (401/403).
 

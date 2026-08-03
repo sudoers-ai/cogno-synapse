@@ -3,7 +3,7 @@
 import pytest
 
 from cogno_synapse import OpenAIEmbedder, OllamaEmbedder, create_embedder
-from cogno_synapse.errors import MissingAPIKeyError
+from cogno_synapse.errors import EmbeddingResponseError, MissingAPIKeyError
 
 
 class _FakeEmbeddings:
@@ -81,6 +81,42 @@ async def test_out_of_order_response_is_mapped_by_index():
     vecs = await _embedder(sink, shuffled=True).embed_batch(["a", "b", "c"])
     straight = await _embedder({}).embed_batch(["a", "b", "c"])
     assert vecs == straight
+
+
+@pytest.mark.asyncio
+async def test_a_provider_that_omits_index_falls_back_to_arrival_order():
+    """`base_url` points this class at any OpenAI-COMPATIBLE provider, and not all of them
+    return `index`. Mapping strictly on that field left every vector empty — silently — which
+    reads as cosine 0.0 on the hot path and overwrites good stored vectors on re-embedding."""
+    class _NoIndex(_FakeEmbeddings):
+        async def create(self, **params):
+            resp = await super().create(**params)
+            for item in resp.data:
+                del item.__class__.index      # a provider that simply does not send it
+            return resp
+
+    client = type("C", (), {"embeddings": _NoIndex({})})()
+    e = OpenAIEmbedder(model="m", api_key="k", base_url="https://compat/v1")
+    e._get_client = lambda: client
+    vecs = await e.embed_batch(["a", "b"])
+    assert all(v for v in vecs), "a provider without `index` must still produce vectors"
+
+
+@pytest.mark.asyncio
+async def test_an_unmappable_response_raises_instead_of_returning_empty_vectors():
+    """The caller cannot tell an empty vector from a legitimately-empty input string, so a
+    short/garbled response must not pass for success."""
+    class _Short(_FakeEmbeddings):
+        async def create(self, **params):
+            resp = await super().create(**params)
+            resp.data = resp.data[:1]          # one vector for two inputs
+            return resp
+
+    client = type("C", (), {"embeddings": _Short({})})()
+    e = OpenAIEmbedder(model="m", api_key="k")
+    e._get_client = lambda: client
+    with pytest.raises(EmbeddingResponseError):
+        await e.embed_batch(["a", "b"])
 
 
 @pytest.mark.asyncio
