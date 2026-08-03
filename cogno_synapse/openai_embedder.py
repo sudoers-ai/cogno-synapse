@@ -32,7 +32,7 @@ import logging
 import os
 
 from cogno_synapse._math import cosine_similarity
-from cogno_synapse.errors import InvalidAPIKeyError
+from cogno_synapse.errors import EmbeddingResponseError, InvalidAPIKeyError
 
 logger = logging.getLogger("cogno_synapse.openai_embedder")
 
@@ -121,12 +121,29 @@ class OpenAIEmbedder:
         # Map by the response's own ``index`` rather than by arrival order. The API documents
         # input order, but pairing a vector with the WRONG text is exactly the silent failure
         # this module exists to avoid — a mis-paired embedding corrupts recall with no error.
+        #
+        # Fall back to arrival order when an item carries no ``index``. ``base_url`` points this
+        # class at any OpenAI-COMPATIBLE provider, and not all of them return the field; with no
+        # fallback the whole batch came back as empty vectors, silently — which then reads as
+        # cosine 0.0 on every hot-path call (NOUMENO drift, the ID's goal similarity) and, on the
+        # re-embedding path, overwrites good stored vectors with nothing.
         out: list[list[float]] = [[] for _ in texts]
-        for item in resp.data:
+        for arrival, item in enumerate(resp.data):
             pos = getattr(item, "index", None)
-            idx = wanted[pos][0] if pos is not None and pos < len(wanted) else None
-            if idx is not None:
-                out[idx] = list(item.embedding)
+            if pos is None:
+                pos = arrival
+            if not isinstance(pos, int) or not 0 <= pos < len(wanted):
+                continue
+            out[wanted[pos][0]] = list(item.embedding)
+
+        # A short/garbled response must not pass for success: the caller cannot tell an empty
+        # vector from a legitimately-empty input string, so say so here instead.
+        missing = [i for (i, _) in wanted if not out[i]]
+        if missing:
+            raise EmbeddingResponseError(
+                f"{self.model!r} returned {len(resp.data)} embedding(s) for {len(wanted)} input(s); "
+                f"{len(missing)} could not be mapped. Refusing to return empty vectors — writing "
+                f"them would corrupt recall with no error.")
         tokens = int(getattr(getattr(resp, "usage", None), "prompt_tokens", 0) or 0)
         return out, tokens
 
