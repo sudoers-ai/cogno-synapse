@@ -51,6 +51,15 @@ def test_bracket_on_own_line_still_rescues():
     assert _names(parse_tool_calls_from_text('- [add_income(amount=40)]', TOOLS)) == ["add_income"]
 
 
+def test_same_line_multi_tag_is_intentionally_not_rescued():
+    # INTENTIONAL narrowing (audit 2026-08-04): the rescue only fires for a tag ALONE on its line,
+    # so two tags on one line — or a tag with trailing prose — are deliberately NOT rescued. This is
+    # the security tradeoff (a bracket embedded in echoed tool output must not execute); a small
+    # model wanting two calls emits them on separate lines (test_bracket_on_own_line_still_rescues).
+    assert parse_tool_calls_from_text('[add_income(amount=1)] [get_summary(period="w")]', TOOLS) is None
+    assert parse_tool_calls_from_text('[get_summary(period="w")] then done', TOOLS) is None
+
+
 def test_unknown_tool_name_ignored():
     # name not in the valid set → not rescued (avoids hallucinated tools)
     assert parse_tool_calls_from_text('<TOOL_CALL>{"tool": "drop_db", "args": {}}</TOOL_CALL>', TOOLS) is None
