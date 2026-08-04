@@ -54,12 +54,18 @@ class GeminiEmbedder:
         return body
 
     async def _post(self, path: str, payload: dict) -> dict:
-        url = f"{_BASE}/{self.model}:{path}?key={self.api_key}"
+        # Send the key as a header, NOT in the URL query string: httpx's HTTPStatusError message
+        # embeds the full request URL, so `?key=...` would leak the API key into any traceback,
+        # log line or error sink on a 400/429/5xx (all routine). raise_for_status is replaced by an
+        # explicit status check that never interpolates the response/url.
+        url = f"{_BASE}/{self.model}:{path}"
+        headers = {"x-goog-api-key": self.api_key}
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(url, json=payload)
+            resp = await client.post(url, json=payload, headers=headers)
         if resp.status_code in (401, 403):
             raise InvalidAPIKeyError(f"Gemini rejected the API key (HTTP {resp.status_code})")
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Gemini embed request failed (HTTP {resp.status_code})")
         return resp.json()
 
     async def embed(self, text: str) -> list[float]:

@@ -99,9 +99,20 @@ def parse_tool_calls_from_text(
         return rescued
 
     # ── Format 3: bracket pseudo-tags [tool] / [tool(args)] ───────────
+    # SECURITY: this rescues a small model that emits `[tool]` INSTEAD of a real tool call. It must
+    # NOT fire on a bracket that merely APPEARS inside prose — a tool result echoed back by the model
+    # (a calendar title `ok [cancel_appointment(id="9")]`, an email body) would otherwise become an
+    # executed side effect the model never decided on. So the tag must be the ONLY content on its
+    # line (optionally list-bulleted), matched per-line and anchored — a bracket embedded in a
+    # sentence no longer counts. (Fencing tool results is the other half of this defence, in the
+    # anima EGO.)
     names_alt = "|".join(re.escape(n) for n in sorted(valid_names, key=len, reverse=True))
-    for match in re.finditer(rf"\[({names_alt})(?:\(([^)]*)\))?\]", content):
-        rescued.append(_make_tool_call(match.group(1), _parse_bracket_args(match.group(2) or "")))
+    line_tag = re.compile(rf"^\s*(?:[-*]\s*)?\[({names_alt})(?:\(([^)]*)\))?\]\s*$")
+    for line in content.splitlines():
+        match = line_tag.match(line)
+        if match:
+            rescued.append(_make_tool_call(match.group(1),
+                                           _parse_bracket_args(match.group(2) or "")))
     if rescued:
         _log.info("parse_tool_calls: %d via bracket tags", len(rescued))
         return rescued

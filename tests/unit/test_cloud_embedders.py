@@ -26,6 +26,7 @@ def _mock_post(monkeypatch, payload, status=200, sink=None):
         if sink is not None:
             sink["url"] = url
             sink["body"] = json
+            sink["headers"] = kw.get("headers") or {}
         return R()
 
     monkeypatch.setattr(httpx.AsyncClient, "post", post)
@@ -39,6 +40,28 @@ async def test_gemini_embed_reads_the_values_field(monkeypatch):
     assert vec == [0.1, 0.2, 0.3]
     assert tokens == 0                       # the endpoint reports no usage
     assert ":embedContent" in sink["url"]
+
+
+@pytest.mark.asyncio
+async def test_gemini_api_key_is_a_header_never_in_the_url(monkeypatch):
+    # SECURITY (audit 2026-08-04): the key must ride in the x-goog-api-key header, NOT the URL
+    # query string — httpx's error message embeds the URL, so `?key=...` leaked the key into any
+    # traceback/log on a routine 400/429/5xx.
+    sink = {}
+    _mock_post(monkeypatch, {"embedding": {"values": [0.1]}}, sink=sink)
+    await GeminiEmbedder(api_key="super-secret-key").embed("hello")
+    assert "super-secret-key" not in sink["url"]
+    assert "key=" not in sink["url"]
+    assert sink["headers"].get("x-goog-api-key") == "super-secret-key"
+
+
+@pytest.mark.asyncio
+async def test_gemini_http_error_message_omits_the_key(monkeypatch):
+    # a non-auth failure (e.g. 429) must raise without interpolating the url/response.
+    _mock_post(monkeypatch, {}, status=429)
+    with pytest.raises(Exception) as ei:
+        await GeminiEmbedder(api_key="super-secret-key").embed("hello")
+    assert "super-secret-key" not in str(ei.value)
 
 
 @pytest.mark.asyncio
