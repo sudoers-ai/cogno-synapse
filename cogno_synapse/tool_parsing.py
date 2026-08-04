@@ -109,10 +109,12 @@ def parse_tool_calls_from_text(
     names_alt = "|".join(re.escape(n) for n in sorted(valid_names, key=len, reverse=True))
     line_tag = re.compile(rf"^\s*(?:[-*]\s*)?\[({names_alt})(?:\(([^)]*)\))?\]\s*$")
     for line in content.splitlines():
-        match = line_tag.match(line)
-        if match:
-            rescued.append(_make_tool_call(match.group(1),
-                                           _parse_bracket_args(match.group(2) or "")))
+        # a distinct name: `match` above is bound by finditer (never None), so reusing it here
+        # would widen it to Optional and break the type contract.
+        line_match = line_tag.match(line)
+        if line_match:
+            rescued.append(_make_tool_call(line_match.group(1),
+                                           _parse_bracket_args(line_match.group(2) or "")))
     if rescued:
         _log.info("parse_tool_calls: %d via bracket tags", len(rescued))
         return rescued

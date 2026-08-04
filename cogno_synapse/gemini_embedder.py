@@ -59,7 +59,7 @@ class GeminiEmbedder:
         # log line or error sink on a 400/429/5xx (all routine). raise_for_status is replaced by an
         # explicit status check that never interpolates the response/url.
         url = f"{_BASE}/{self.model}:{path}"
-        headers = {"x-goog-api-key": self.api_key}
+        headers: dict[str, str] = {"x-goog-api-key": self.api_key or ""}
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             resp = await client.post(url, json=payload, headers=headers)
         if resp.status_code in (401, 403):
