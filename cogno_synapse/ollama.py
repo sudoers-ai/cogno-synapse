@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Optional
 
@@ -14,6 +15,34 @@ from cogno_synapse._obs import log_done, log_request, warn_if_retryable
 logger = logging.getLogger("cogno_synapse.ollama")
 
 
+
+# How long to wait on a single Ollama call. 120 s is right for a GPU box; a CPU-only host
+# (a small VM, a CI runner) can take longer than that for one generation on an 8B model and
+# was dying on httpx.ReadTimeout with nothing wrong but the clock — that is what turned the
+# nightly canaries in cogno-anima and cogno-soma red. Env-steerable so the deployment that
+# knows its own hardware can say so, without every call site growing a parameter.
+_TIMEOUT_ENV = "COGNO_OLLAMA_TIMEOUT"
+_DEFAULT_TIMEOUT = 120
+
+
+def default_timeout() -> int:
+    """Seconds to allow one Ollama call: ``$COGNO_OLLAMA_TIMEOUT`` or 120.
+
+    Read per construction, not at import, so a test or a host can set the variable after
+    this module is already loaded. A non-numeric or non-positive value falls back to the
+    default rather than raising — a bad env var must not take the process down.
+    """
+    raw = os.environ.get(_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_TIMEOUT
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("stage=synapse event=bad_timeout_env var=%s value=%r", _TIMEOUT_ENV, raw)
+        return _DEFAULT_TIMEOUT
+    return value if value > 0 else _DEFAULT_TIMEOUT
+
+
 class OllamaBackend(LLMBackend):
     """
     Concrete LLM backend that calls a local Ollama instance.
@@ -22,7 +51,7 @@ class OllamaBackend(LLMBackend):
         self,
         model: str,
         base_url: str = "http://localhost:11434",
-        timeout: int = 120,
+        timeout: Optional[int] = None,
         temperature: Optional[float] = None,
         num_ctx: Optional[int] = 8192,
         max_tokens: Optional[int] = 4096,
@@ -31,7 +60,7 @@ class OllamaBackend(LLMBackend):
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
+        self.timeout = timeout if timeout is not None else default_timeout()
         self.temperature = temperature
         self.num_ctx = num_ctx
         self.max_tokens = max_tokens
@@ -113,11 +142,11 @@ class OllamaEmbedder(Embedder):
         self,
         model: str = "nomic-embed-text",
         base_url: str = "http://localhost:11434",
-        timeout: int = 120,
+        timeout: Optional[int] = None,
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
+        self.timeout = timeout if timeout is not None else default_timeout()
 
     async def embed(self, text: str) -> list[float]:
         vec, _ = await self.embed_with_usage(text)
