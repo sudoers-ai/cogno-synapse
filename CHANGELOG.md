@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.2 — 2026-08-04
+
+The Ollama call timeout stops assuming a GPU.
+
+- `$COGNO_OLLAMA_TIMEOUT` sets the per-call timeout for `OllamaBackend` and
+  `OllamaEmbedder` (default 120 s, unchanged). Read per construction rather than
+  at import, so a host or a test can set it after the module is loaded; an
+  explicit `timeout=` argument still wins; a non-numeric or non-positive value
+  logs and falls back rather than raising or silently removing the bound.
+
+  120 s is right for a GPU box and short for ONE generation on an 8B model on
+  CPU. That is not hypothetical: the nightly Ollama canaries in `cogno-anima`
+  and `cogno-soma` both went red on `httpx.ReadTimeout` — cogno-anima at 40 of
+  41 tests passing — with nothing wrong but the clock. Any host doing CPU-only
+  inference hits the same wall.
+
 ## 0.1.1 — 2026-08-02
 
 Embeddings gain the cloud. The `Embedder` protocol previously had exactly one
