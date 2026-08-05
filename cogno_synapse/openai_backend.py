@@ -26,6 +26,25 @@ from cogno_synapse._obs import log_done, log_request, warn_if_retryable
 logger = logging.getLogger("cogno_synapse.openai")
 
 
+def _warn_if_truncated(resp: object, model: str) -> bool:
+    """Log when the PROVIDER says it cut the response. Returns whether it did.
+
+    ``finish_reason`` is "length" when the answer hit the token ceiling and "content_filter"
+    when it was cut for policy. Both arrive as an ordinary successful response with a shorter
+    string — no exception, no type difference — so a truncation is only ever discovered later,
+    by whatever chokes on the fragment, and reported as that thing instead.
+    """
+    try:
+        reason = str(getattr(resp.choices[0], "finish_reason", "") or "")  # type: ignore[attr-defined]
+    except (AttributeError, IndexError):
+        return False
+    if reason in ("length", "content_filter"):
+        logger.warning("event=truncated_response provider=openai model=%s finish_reason=%s",
+                       model, reason)
+        return True
+    return False
+
+
 def _is_auth_error(exc: Exception) -> bool:
     if type(exc).__name__ in ("AuthenticationError", "PermissionDeniedError"):
         return True
@@ -95,6 +114,19 @@ class OpenAIBackend:
             tokens_in = usage.prompt_tokens if usage else 0
             tokens_out = usage.completion_tokens if usage else 0
             log_done(logger, "openai", self.model, t0, tokens_in, tokens_out)
+            # A cut response is indistinguishable from a complete one at this layer — same
+            # shape, same type, no exception — so it travels on and fails much later, where
+            # the damage is diagnosed as something else. Measured 2026-08-04: a NOUMENO
+            # payload arrived ending mid-string ("…about the volume of c"), raised
+            # StageParseError, and killed the user's turn; the report said "bad JSON", which
+            # is what the parser saw and not what happened. `finish_reason` is the provider
+            # telling us plainly, and nothing read it.
+            #
+            # A WARNING, not an exception: the caller may still salvage a truncated answer
+            # (a prose reply loses its tail, not its meaning), and raising here would turn a
+            # degraded turn into a dead one. What it buys is a log line naming the cause, at
+            # the only layer that can see it.
+            _warn_if_truncated(resp, self.model)
             return (resp.choices[0].message.content or "", tokens_in, tokens_out)
         except Exception as exc:
             if _is_auth_error(exc):
@@ -123,6 +155,7 @@ class OpenAIBackend:
             usage = resp.usage
             tokens_in = usage.prompt_tokens if usage else 0
             tokens_out = usage.completion_tokens if usage else 0
+            _warn_if_truncated(resp, self.model)
             result: dict = {"content": msg.content or ""}
             if msg.tool_calls:
                 result["tool_calls"] = [_openai_tool_call(tc) for tc in msg.tool_calls]
