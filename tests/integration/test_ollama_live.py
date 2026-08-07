@@ -23,7 +23,7 @@ from cogno_synapse import OllamaBackend, OllamaEmbedder
 from cogno_synapse.cache import CachingEmbedder
 
 BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-GEN_MODEL = os.getenv("COGNO_TEST_OLLAMA_MODEL", "mistral:latest")
+GEN_MODEL = os.getenv("COGNO_TEST_OLLAMA_MODEL", "qwen3:8b")
 EMBED_MODEL = os.getenv("COGNO_TEST_OLLAMA_EMBED_MODEL", "nomic-embed-text")
 
 
