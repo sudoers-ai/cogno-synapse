@@ -60,6 +60,17 @@ class _ToolResp:
         self.usage = type("U", (), {"prompt_tokens": 11, "completion_tokens": 18})()
 
 
+class _UnsupportedParamError(Exception):
+    """The OTHER 400 that also carries ``param='reasoning_effort'``: an endpoint that does not
+    accept the parameter at all. Retrying here re-sends what was just rejected."""
+
+    param = "reasoning_effort"
+
+    def __str__(self) -> str:
+        return ("Error code: 400 - {'error': {'message': \"Unsupported parameter: "
+                "'reasoning_effort' is not supported with this model.\"}}")
+
+
 class _ReasoningToolsError(Exception):
     """The provider's real 400, verbatim (measured 2026-08-20 on gpt-5.6-luna)."""
 
@@ -75,7 +86,11 @@ class _ReasoningToolsError(Exception):
     (_ReasoningToolsError(), True),
     # message-only (no ``param`` attribute) — a raw wire error still has to match
     (Exception("Function tools with reasoning_effort are not supported for x"), True),
-    # both signals required: an unrelated 400 mentioning one word must NOT trigger a retry
+    # BOTH signals required — and this must be the REALISTIC shape: the SDK sets
+    # param='reasoning_effort' on a plain "unsupported parameter" 400 too, which is what an
+    # OpenAI-compatible endpoint (base_url) returns when it rejects the parameter outright.
+    # A bare Exception has no ``param`` and so never reached the branch it was meant to pin.
+    (_UnsupportedParamError(), False),
     (Exception("Unsupported parameter: reasoning_effort"), False),
     (Exception("Function tools are not supported for this model"), False),
     (Exception("rate limit exceeded"), False),
@@ -165,7 +180,7 @@ async def test_generate_keeps_full_reasoning():
     class _Completions:
         async def create(self, **kw):
             seen.append(kw)
-            return _Resp("stop")
+            raise _ReasoningToolsError()      # the same 400 chat_with_tools recovers from
 
     class _Client:
         chat = type("Chat", (), {"completions": _Completions()})()
@@ -175,5 +190,44 @@ async def test_generate_keeps_full_reasoning():
 
     b = OpenAIBackend(model="gpt-5.6-luna", api_key="sk-x")
     b._client = lambda: _Client()  # type: ignore[method-assign]
-    await b.generate("system", "prompt")
+
+    # It must PROPAGATE here, not be recovered: a stub that always succeeds proved nothing —
+    # copying the retry into ``generate`` left the old version of this test green.
+    with pytest.raises(Exception, match="Function tools"):
+        await b.generate("system", "prompt")
+    assert len(seen) == 1, "generate must not retry — the remedy disables reasoning"
     assert "reasoning_effort" not in seen[0]
+
+
+@pytest.mark.asyncio
+async def test_the_conflict_is_learned_once_not_rediscovered_every_step():
+    """An affected model fails EVERY tool call, and the EGO reuses one backend across 5–8 steps
+    plus correction retries. Without memoising, each step pays a full failed round-trip first —
+    5–8 wasted 400s per turn, every turn, forever."""
+    from cogno_synapse.openai_backend import OpenAIBackend
+
+    seen: list = []
+
+    class _Completions:
+        async def create(self, **kw):
+            seen.append(dict(kw))
+            if "reasoning_effort" not in kw:
+                raise _ReasoningToolsError()
+            return _ToolResp()
+
+    class _Client:
+        chat = type("Chat", (), {"completions": _Completions()})()
+
+        async def close(self):
+            return None
+
+    b = OpenAIBackend(model="gpt-5.6-luna", api_key="sk-x")
+    b._client = lambda: _Client()  # type: ignore[method-assign]
+    tools = [{"type": "function", "function": {"name": "t", "parameters": {}}}]
+
+    await b.chat_with_tools([{"role": "user", "content": "a"}], tools)   # 400 + retry
+    await b.chat_with_tools([{"role": "user", "content": "b"}], tools)   # must go straight
+    await b.chat_with_tools([{"role": "user", "content": "c"}], tools)
+
+    assert len(seen) == 4, f"expected 2 calls then 1 each, got {len(seen)}"
+    assert all("reasoning_effort" in c for c in seen[1:])

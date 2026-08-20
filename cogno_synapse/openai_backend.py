@@ -88,6 +88,10 @@ class OpenAIBackend:
         # Point at any OpenAI-compatible endpoint (DeepSeek, Moonshot/Kimi, xAI,
         # OpenRouter, Together, Fireworks, …). None → OpenAI's default base URL.
         self.base_url = base_url
+        # Learned once per instance: an affected model fails EVERY tool call, and the EGO
+        # reuses one backend across 5–8 steps plus correction retries. Rediscovering the
+        # conflict each time buys nothing and costs a full failed round-trip per step.
+        self._tools_need_effort_none = False
         if not self.api_key:
             logger.warning("OPENAI_API_KEY not set — OpenAI calls will fail")
 
@@ -192,6 +196,8 @@ class OpenAIBackend:
             kwargs["tool_choice"] = tool_choice
         if self.temperature is not None and not self._is_o_series:
             kwargs["temperature"] = self.temperature
+        if self._tools_need_effort_none and tools:
+            kwargs["reasoning_effort"] = "none"
         try:
             try:
                 resp = await client.chat.completions.create(**kwargs)
@@ -215,6 +221,7 @@ class OpenAIBackend:
                     "reasoning_effort='none' (the provider's stated remedy)", self.model)
                 kwargs["reasoning_effort"] = "none"
                 resp = await client.chat.completions.create(**kwargs)
+                self._tools_need_effort_none = True      # don't pay the 400 again
             msg = resp.choices[0].message
             usage = resp.usage
             tokens_in = usage.prompt_tokens if usage else 0
@@ -249,12 +256,17 @@ def _is_reasoning_tools_conflict(exc: Exception) -> bool:
     someone notices. Both signals must point at reasoning AND tools, so an unrelated 400 that
     happens to mention one of the words does not trigger a pointless retry.
     """
-    param = str(getattr(exc, "param", "") or "")
-    text = str(exc)
-    if param == "reasoning_effort":
-        return True
-    low = text.lower()
-    return "reasoning_effort" in low and "function tools" in low
+    low = str(exc).lower()
+    # The TOOLS half is what separates "reasoning conflicts with tools" (retry helps) from
+    # "this endpoint does not accept reasoning_effort at all" (retry re-sends the very
+    # parameter just rejected — a guaranteed second 400, double latency, and the caller ends
+    # up seeing the retry's error instead of the original). An OpenAI-COMPATIBLE endpoint
+    # reached through ``base_url`` returns exactly that second shape, and the SDK sets
+    # ``param='reasoning_effort'`` on BOTH — so the param alone cannot be the trigger.
+    if "function tools" not in low:
+        return False
+    return ("reasoning_effort" in low
+            or str(getattr(exc, "param", "") or "") == "reasoning_effort")
 
 
 def _openai_tool_call(tc) -> dict:
