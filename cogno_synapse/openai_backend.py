@@ -193,7 +193,28 @@ class OpenAIBackend:
         if self.temperature is not None and not self._is_o_series:
             kwargs["temperature"] = self.temperature
         try:
-            resp = await client.chat.completions.create(**kwargs)
+            try:
+                resp = await client.chat.completions.create(**kwargs)
+            except Exception as exc:
+                # Some reasoning models refuse function tools while reasoning is on, and say so
+                # precisely: "Function tools with reasoning_effort are not supported for
+                # <model> in /v1/chat/completions. To use function tools, use /v1/responses or
+                # set reasoning_effort to 'none'." Measured 2026-08-20 on gpt-5.6-luna/terra/sol
+                # — every EGO turn on those models died with a 400 while gpt-5/-mini/-nano and
+                # the 5.4 family were unaffected.
+                #
+                # RETRY on the provider's own instruction rather than hardcoding a model list:
+                # the constraint belongs to the model, not to a name we can enumerate, and a
+                # future model with the same rule works without another release. Applied ONLY
+                # here, so ``generate`` (NOUMENO/NER/voice) keeps full reasoning — the trade is
+                # made where tools are required, not everywhere.
+                if not _is_reasoning_tools_conflict(exc):
+                    raise
+                logger.warning(
+                    "stage=LLM event=reasoning_tools_conflict model=%s — retrying with "
+                    "reasoning_effort='none' (the provider's stated remedy)", self.model)
+                kwargs["reasoning_effort"] = "none"
+                resp = await client.chat.completions.create(**kwargs)
             msg = resp.choices[0].message
             usage = resp.usage
             tokens_in = usage.prompt_tokens if usage else 0
@@ -218,6 +239,22 @@ class OpenAIBackend:
 
     def supports_native_tools(self) -> bool:
         return True
+
+
+def _is_reasoning_tools_conflict(exc: Exception) -> bool:
+    """The provider refusing function tools because reasoning is enabled.
+
+    Matched on the error's own ``param``/message rather than on a model-name list: the rule is
+    the model's, and enumerating names means the next model with it fails in production until
+    someone notices. Both signals must point at reasoning AND tools, so an unrelated 400 that
+    happens to mention one of the words does not trigger a pointless retry.
+    """
+    param = str(getattr(exc, "param", "") or "")
+    text = str(exc)
+    if param == "reasoning_effort":
+        return True
+    low = text.lower()
+    return "reasoning_effort" in low and "function tools" in low
 
 
 def _openai_tool_call(tc) -> dict:
