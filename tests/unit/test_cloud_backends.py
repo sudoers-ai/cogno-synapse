@@ -339,3 +339,36 @@ async def test_an_openai_COMPATIBLE_provider_never_gets_the_parameter(monkeypatc
         lambda **kw: seen.update(kw) or _resp('{"ok":true}')))
     await b.generate("Responda em JSON.", "oi")
     assert "response_format" not in seen
+
+
+@pytest.mark.asyncio
+async def test_the_CONTACT_cannot_force_json_mode(monkeypatch):
+    """Entrada do usuário não decide parâmetro de API.
+
+    O prompt da voz do SUPEREGO embute `# User request\n"{ctx.user_input}"` literalmente, então
+    a primeira versão — que lia `system` E `prompt` — deixava um cliente que escrevesse "me
+    manda em json", ou só citasse `config.json`, flipar uma chamada de PROSA para `json_object`
+    e receber um objeto JSON como resposta.
+
+    Mutação: voltar a ler o `prompt` e este teste morre."""
+    seen: dict = {}
+    b = OpenAIBackend(model="gpt-4o-mini", api_key="k")
+    monkeypatch.setattr(b, "_client", lambda: FakeOpenAIClient(
+        lambda **kw: seen.update(kw) or _resp("claro!")))
+    await b.generate("Você é uma consultora comercial.",
+                     '# User request\n"meu arquivo config.json deu erro"')
+    assert "response_format" not in seen
+
+
+@pytest.mark.asyncio
+async def test_a_reasoning_model_never_gets_response_format(monkeypatch):
+    """A série o1/o3/o4/gpt-5 já tem tratamento próprio de parâmetros aqui e recusa
+    `response_format`: mandar trocaria um JSON malformado ocasional por 400 em todo turno.
+
+    Mutação: tirar `and not self._is_o_series` e este teste morre."""
+    seen: dict = {}
+    b = OpenAIBackend(model="gpt-5", api_key="k")
+    monkeypatch.setattr(b, "_client", lambda: FakeOpenAIClient(
+        lambda **kw: seen.update(kw) or _resp('{"ok":true}')))
+    await b.generate("Reply ONLY with JSON.", "oi")
+    assert "response_format" not in seen

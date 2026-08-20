@@ -45,9 +45,20 @@ def _warn_if_truncated(resp: object, model: str) -> bool:
     return False
 
 
-def _wants_json(system: str, prompt: str) -> bool:
-    """O chamador pediu JSON? (a palavra precisa estar nas mensagens — regra da própria API)"""
-    return "json" in f"{system} {prompt}".lower()
+def _wants_json(system: str) -> bool:
+    """O CHAMADOR pediu JSON — lendo só o system prompt, que é nosso.
+
+    A primeira versão lia também o `prompt`, e ali mora texto do contato: o prompt da voz
+    do SUPEREGO embute `# User request\n"{ctx.user_input}"` literalmente. Com isso um cliente
+    que escrevesse "me manda em json" — ou só citasse `config.json` — flipava uma chamada de
+    PROSA para `json_object` e recebia um objeto JSON como resposta. Entrada do usuário
+    decidindo parâmetro de API é o defeito, não a redação.
+
+    A regra da OpenAI (a palavra "json" tem de aparecer nas mensagens) continua satisfeita: os
+    prompts de NOUMENO e NER a trazem no system, que é onde deve estar — quem pede o formato é
+    o estágio, não quem conversa.
+    """
+    return "json" in (system or "").lower()
 
 
 def _is_auth_error(exc: Exception) -> bool:
@@ -92,8 +103,13 @@ class OpenAIBackend:
         Fireworks) via `base_url`, e nem todos aceitam o parâmetro — mandar às cegas trocaria um
         JSON malformado ocasional por um 400 em todo turno, que é bem pior. Sem `base_url` =
         OpenAI de verdade.
+
+        Fora também a série de raciocínio (o1/o3/o4/gpt-5): ela já tem tratamento próprio de
+        parâmetros aqui (`max_completion_tokens` em vez de `max_tokens`, sem `temperature`), e
+        mandar `response_format` a um modelo que o recusa troca um JSON malformado ocasional
+        por um 400 em TODO turno — a mesma troca ruim que o guard de `base_url` evita.
         """
-        return not self.base_url
+        return not self.base_url and not self._is_o_series
 
     def _token_limit_kwargs(self) -> dict:
         key = "max_completion_tokens" if self._is_o_series else "max_tokens"
@@ -131,7 +147,7 @@ class OpenAIBackend:
         # O gatilho NÃO é heurística frouxa: a própria OpenAI RECUSA `json_object` se a palavra
         # "json" não aparecer nas mensagens, então a condição que checamos é a mesma que a API
         # impõe. Um prompt que não pede JSON não entra no modo, e nada muda para ele.
-        if _wants_json(system, prompt) and self._supports_json_mode():
+        if _wants_json(system) and self._supports_json_mode():
             kwargs["response_format"] = {"type": "json_object"}
         log_request(logger, "openai", self.model, system, prompt)
         try:
