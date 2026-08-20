@@ -88,6 +88,10 @@ class OpenAIBackend:
         # Point at any OpenAI-compatible endpoint (DeepSeek, Moonshot/Kimi, xAI,
         # OpenRouter, Together, Fireworks, …). None → OpenAI's default base URL.
         self.base_url = base_url
+        # Learned once per instance: an affected model fails EVERY tool call, and the EGO
+        # reuses one backend across 5–8 steps plus correction retries. Rediscovering the
+        # conflict each time buys nothing and costs a full failed round-trip per step.
+        self._tools_need_effort_none = False
         if not self.api_key:
             logger.warning("OPENAI_API_KEY not set — OpenAI calls will fail")
 
@@ -192,8 +196,32 @@ class OpenAIBackend:
             kwargs["tool_choice"] = tool_choice
         if self.temperature is not None and not self._is_o_series:
             kwargs["temperature"] = self.temperature
+        if self._tools_need_effort_none and tools:
+            kwargs["reasoning_effort"] = "none"
         try:
-            resp = await client.chat.completions.create(**kwargs)
+            try:
+                resp = await client.chat.completions.create(**kwargs)
+            except Exception as exc:
+                # Some reasoning models refuse function tools while reasoning is on, and say so
+                # precisely: "Function tools with reasoning_effort are not supported for
+                # <model> in /v1/chat/completions. To use function tools, use /v1/responses or
+                # set reasoning_effort to 'none'." Measured 2026-08-20 on gpt-5.6-luna/terra/sol
+                # — every EGO turn on those models died with a 400 while gpt-5/-mini/-nano and
+                # the 5.4 family were unaffected.
+                #
+                # RETRY on the provider's own instruction rather than hardcoding a model list:
+                # the constraint belongs to the model, not to a name we can enumerate, and a
+                # future model with the same rule works without another release. Applied ONLY
+                # here, so ``generate`` (NOUMENO/NER/voice) keeps full reasoning — the trade is
+                # made where tools are required, not everywhere.
+                if not _is_reasoning_tools_conflict(exc):
+                    raise
+                logger.warning(
+                    "stage=LLM event=reasoning_tools_conflict model=%s — retrying with "
+                    "reasoning_effort='none' (the provider's stated remedy)", self.model)
+                kwargs["reasoning_effort"] = "none"
+                resp = await client.chat.completions.create(**kwargs)
+                self._tools_need_effort_none = True      # don't pay the 400 again
             msg = resp.choices[0].message
             usage = resp.usage
             tokens_in = usage.prompt_tokens if usage else 0
@@ -218,6 +246,27 @@ class OpenAIBackend:
 
     def supports_native_tools(self) -> bool:
         return True
+
+
+def _is_reasoning_tools_conflict(exc: Exception) -> bool:
+    """The provider refusing function tools because reasoning is enabled.
+
+    Matched on the error's own ``param``/message rather than on a model-name list: the rule is
+    the model's, and enumerating names means the next model with it fails in production until
+    someone notices. Both signals must point at reasoning AND tools, so an unrelated 400 that
+    happens to mention one of the words does not trigger a pointless retry.
+    """
+    low = str(exc).lower()
+    # The TOOLS half is what separates "reasoning conflicts with tools" (retry helps) from
+    # "this endpoint does not accept reasoning_effort at all" (retry re-sends the very
+    # parameter just rejected — a guaranteed second 400, double latency, and the caller ends
+    # up seeing the retry's error instead of the original). An OpenAI-COMPATIBLE endpoint
+    # reached through ``base_url`` returns exactly that second shape, and the SDK sets
+    # ``param='reasoning_effort'`` on BOTH — so the param alone cannot be the trigger.
+    if "function tools" not in low:
+        return False
+    return ("reasoning_effort" in low
+            or str(getattr(exc, "param", "") or "") == "reasoning_effort")
 
 
 def _openai_tool_call(tc) -> dict:
