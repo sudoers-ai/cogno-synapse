@@ -291,3 +291,51 @@ def test_fallback_requires_backends():
 def test_fallback_supports_native_tools_any():
     assert FallbackBackend([FakeBackend(native=False), FakeBackend(native=True)]).supports_native_tools()
     assert not FallbackBackend([FakeBackend(native=False)]).supports_native_tools()
+
+
+# ── JSON mode: o prompt pede JSON, a API garante JSON ────────────────────────────────
+@pytest.mark.asyncio
+async def test_json_mode_is_requested_when_the_prompt_asks_for_json(monkeypatch):
+    """Sem isso o modelo devolve JSON "quase válido" e o estágio derruba o turno do cliente.
+
+    Medido 2026-08-19: `StageParseError` no NOUMENO em 12,5% dos cenários do closer_bench com
+    gpt-4o-mini — intermitente, sempre no `context_turn`, sempre por volta do caractere 211. O
+    provedor devolveu `finish_reason` normal, então NÃO era corte de stream nem teto de tokens:
+    era JSON malformado, e o retry de truncamento gastava uma segunda chamada para falhar igual.
+
+    Mutação: tirar o `response_format` e este teste morre."""
+    seen: dict = {}
+    b = OpenAIBackend(model="gpt-4o-mini", api_key="k")
+    monkeypatch.setattr(b, "_client", lambda: FakeOpenAIClient(
+        lambda **kw: seen.update(kw) or _resp('{"ok":true}')))
+    await b.generate("Responda em JSON válido.", "oi")
+    assert seen.get("response_format") == {"type": "json_object"}
+
+
+@pytest.mark.asyncio
+async def test_a_prompt_that_does_NOT_ask_for_json_is_untouched(monkeypatch):
+    """O gatilho não é heurística frouxa: a própria OpenAI RECUSA `json_object` quando a
+    palavra "json" não aparece nas mensagens, então checamos a mesma condição que a API impõe.
+    Um prompt de conversa não entra no modo — e não pode entrar, ou toda resposta viraria JSON."""
+    seen: dict = {}
+    b = OpenAIBackend(model="gpt-4o-mini", api_key="k")
+    monkeypatch.setattr(b, "_client", lambda: FakeOpenAIClient(
+        lambda **kw: seen.update(kw) or _resp("olá")))
+    await b.generate("Você é um consultor comercial.", "bom dia")
+    assert "response_format" not in seen
+
+
+@pytest.mark.asyncio
+async def test_an_openai_COMPATIBLE_provider_never_gets_the_parameter(monkeypatch):
+    """A classe serve DeepSeek, Moonshot, xAI, OpenRouter, Together e Fireworks via `base_url`,
+    e nem todos aceitam `response_format`. Mandar às cegas trocaria um JSON malformado ocasional
+    por um 400 em TODO turno — bem pior que o defeito que se conserta.
+
+    Mutação: remover o guard de `base_url` e este teste morre."""
+    seen: dict = {}
+    b = OpenAIBackend(model="deepseek-chat", api_key="k",
+                      base_url="https://api.deepseek.com")
+    monkeypatch.setattr(b, "_client", lambda: FakeOpenAIClient(
+        lambda **kw: seen.update(kw) or _resp('{"ok":true}')))
+    await b.generate("Responda em JSON.", "oi")
+    assert "response_format" not in seen

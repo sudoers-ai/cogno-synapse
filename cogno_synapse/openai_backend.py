@@ -45,6 +45,11 @@ def _warn_if_truncated(resp: object, model: str) -> bool:
     return False
 
 
+def _wants_json(system: str, prompt: str) -> bool:
+    """O chamador pediu JSON? (a palavra precisa estar nas mensagens — regra da própria API)"""
+    return "json" in f"{system} {prompt}".lower()
+
+
 def _is_auth_error(exc: Exception) -> bool:
     if type(exc).__name__ in ("AuthenticationError", "PermissionDeniedError"):
         return True
@@ -80,6 +85,16 @@ class OpenAIBackend:
         m = self.model.lower()
         return m.startswith(("o1", "o3", "o4", "gpt-5"))
 
+    def _supports_json_mode(self) -> bool:
+        """`response_format={"type":"json_object"}` só vale para a API da OpenAI.
+
+        A classe serve TAMBÉM os compatíveis (DeepSeek, Moonshot, xAI, OpenRouter, Together,
+        Fireworks) via `base_url`, e nem todos aceitam o parâmetro — mandar às cegas trocaria um
+        JSON malformado ocasional por um 400 em todo turno, que é bem pior. Sem `base_url` =
+        OpenAI de verdade.
+        """
+        return not self.base_url
+
     def _token_limit_kwargs(self) -> dict:
         key = "max_completion_tokens" if self._is_o_series else "max_tokens"
         return {key: self.max_tokens}
@@ -106,6 +121,18 @@ class OpenAIBackend:
         }
         if self.temperature is not None and not self._is_o_series:
             kwargs["temperature"] = self.temperature
+        # JSON MODE quando o prompt pede JSON. Sem isso o modelo devolve JSON "quase válido" e
+        # o estágio derruba o turno do cliente: medido 2026-08-19, `StageParseError` no NOUMENO
+        # em 12,5% dos cenários do closer_bench com gpt-4o-mini, intermitente, sempre no
+        # `context_turn`, sempre por volta do caractere 211. O provedor devolveu `finish_reason`
+        # normal — não era corte de stream nem teto de tokens, era JSON malformado mesmo, e o
+        # retry de truncamento (que existe) gastava uma segunda chamada para falhar igual.
+        #
+        # O gatilho NÃO é heurística frouxa: a própria OpenAI RECUSA `json_object` se a palavra
+        # "json" não aparecer nas mensagens, então a condição que checamos é a mesma que a API
+        # impõe. Um prompt que não pede JSON não entra no modo, e nada muda para ele.
+        if _wants_json(system, prompt) and self._supports_json_mode():
+            kwargs["response_format"] = {"type": "json_object"}
         log_request(logger, "openai", self.model, system, prompt)
         try:
             t0 = time.perf_counter()
