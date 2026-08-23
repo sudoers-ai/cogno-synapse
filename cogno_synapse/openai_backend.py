@@ -79,12 +79,18 @@ class OpenAIBackend:
         max_tokens: int = 4096,
         timeout: int = 120,
         base_url: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         self.model = model
         self.api_key = api_key or os.getenv("OPENAI_API_KEY", "")
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.timeout = timeout
+        # Reasoning budget for the o-series/gpt-5 models. Default None = SEND NOTHING and let
+        # the provider apply its own default. A library-wide "low" would quietly re-tune every
+        # consumer's quality/cost trade-off on upgrade — the opposite of what a transport layer
+        # is allowed to decide. Opt in per instance, or deployment-wide via the env var.
+        self.reasoning_effort = reasoning_effort or os.getenv("OPENAI_REASONING_EFFORT") or None
         # Point at any OpenAI-compatible endpoint (DeepSeek, Moonshot/Kimi, xAI,
         # OpenRouter, Together, Fireworks, …). None → OpenAI's default base URL.
         self.base_url = base_url
@@ -139,6 +145,8 @@ class OpenAIBackend:
                          {"role": "user", "content": prompt}],
             **self._token_limit_kwargs(),
         }
+        if self._is_o_series and self.reasoning_effort:
+            kwargs["reasoning_effort"] = self.reasoning_effort
         if self.temperature is not None and not self._is_o_series:
             kwargs["temperature"] = self.temperature
         # JSON MODE quando o prompt pede JSON. Sem isso o modelo devolve JSON "quase válido" e
@@ -196,6 +204,8 @@ class OpenAIBackend:
             kwargs["tool_choice"] = tool_choice
         if self.temperature is not None and not self._is_o_series:
             kwargs["temperature"] = self.temperature
+        if self._is_o_series and self.reasoning_effort and not self._tools_need_effort_none:
+            kwargs["reasoning_effort"] = self.reasoning_effort
         if self._tools_need_effort_none and tools:
             kwargs["reasoning_effort"] = "none"
         try:
