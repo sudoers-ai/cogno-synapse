@@ -27,11 +27,12 @@ jobs:
         run: ruff check cogno_synapse tests examples
       - name: Type-check (mypy)
         run: mypy cogno_synapse
-      - name: Unit tests
-        # Integration tests against real provider APIs auto-skip without keys;
-        # the unit suite mocks every SDK/HTTP client.
-        run: pytest tests/unit -q --cov=cogno_synapse --cov-report=term-missing
-      - name: Integration tests (auto-skip without Ollama / cloud keys)
-        # No Ollama server or API keys in CI → every integration test skips, so
-        # this stays green; it runs for real locally (Ollama up) or with keys set.
-        run: pytest tests/integration -q
+      - name: Tests
+        # ONE step that names no child of `tests/`. Naming the children
+        # (`tests/unit`, `tests/integration`) means the day a third one appears it
+        # runs nowhere and CI stays green — measured across the ecosystem on
+        # 2026-09-02, and pinned here by tests/unit/test_ci_runs_every_test_file.py.
+        # The unit suite mocks every SDK/HTTP client; the integration suite is gated
+        # on a reachable Ollama and real provider keys, so with neither present in CI
+        # it collects and skips instead of failing.
+        run: pytest tests -q --cov=cogno_synapse --cov-report=term-missing
