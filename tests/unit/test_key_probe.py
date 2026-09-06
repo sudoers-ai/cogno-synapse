@@ -1,9 +1,11 @@
-"""The BYOK auth probe: the fail-open bias, and the per-provider auth dialect.
+"""The BYOK auth probe: the verdict bias, and the per-provider auth dialect.
 
 Two properties are worth protecting here and they fail in opposite directions:
 
-* the **bias** — only a real rejection (or a blank key) says "invalid"; everything else,
-  including our own inability to reach the provider, says "valid";
+* the **bias**, which splits in two and is fail-open on only one half — our own inability to
+  reach the provider says "valid", but every error status a provider we DID reach sent back
+  says "invalid", a 429 and a 500 included (the verdict is ``status_code < 400``). That
+  second half is pinned below as MEASURED behaviour, not as a design anyone argued for;
 * the **dialect** — each provider is handed the key the way IT reads keys. A dialect bug is
   the quiet one: the request goes out unauthenticated, the provider answers 401, and a
   perfectly good key is branded invalid for every user of that provider. So the dialect is
@@ -11,6 +13,9 @@ Two properties are worth protecting here and they fail in opposite directions:
 """
 
 from __future__ import annotations
+
+import pathlib
+import re
 
 import httpx
 import pytest
@@ -59,11 +64,31 @@ async def test_a_2xx_says_the_key_is_live(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_an_auth_rejection_is_the_only_verdict_that_invalidates(monkeypatch):
+async def test_an_auth_rejection_invalidates(monkeypatch):
     _patch(monkeypatch, status=401)
     assert await probe_api_key("openai", "sk-bad") is False
     _patch(monkeypatch, status=403)
     assert await probe_api_key("anthropic", "bad") is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [429, 500, 502, 503])
+async def test_an_error_status_from_a_reached_provider_also_invalidates(monkeypatch, status):
+    """MEASURED behaviour, pinned so it cannot drift in silence again.
+
+    The verdict is ``status_code < 400``, so a rate limit and a provider outage brand the key
+    invalid exactly as an auth rejection does. Nothing asserted this before, which is how the
+    module docstring and the README came to claim the opposite of the code while the function
+    docstring claimed the truth — three statements of one rule, two of them wrong, and no test
+    to referee them.
+
+    Whether this is the RIGHT bias is a separate question and deliberately not settled here:
+    changing it is a behaviour change, and this file's job today is to say what the behaviour
+    IS. The sharp edge, for whoever takes that question up, is 429 — a rate limit arrives
+    precisely when a key is being used hard, i.e. when it is most demonstrably alive.
+    """
+    _patch(monkeypatch, status=status)
+    assert await probe_api_key("openai", "sk-live-but-throttled") is False
 
 
 @pytest.mark.asyncio
@@ -173,3 +198,34 @@ def test_every_shipped_probe_uses_a_dialect_the_code_implements():
     assert {style for _url, style in API_KEY_PROBES.values()} <= {
         "bearer", "anthropic", "gemini", "xi"}
     assert all(url.startswith("https://") for url, _style in API_KEY_PROBES.values())
+
+
+# ── the rule is stated three times; nothing used to compare the three ─────────────────
+
+def test_the_prose_quotes_the_verdict_expression_the_code_actually_runs():
+    """Three statements of one rule diverged because nothing compared them.
+
+    The verdict lives in exactly one expression. The three long-form statements of it — this
+    module's docstring, ``probe_api_key``'s own docstring, and the README's BYOK section —
+    are three copies of that one fact, and two of them had drifted to say its OPPOSITE with
+    nobody noticing, because prose has no gate. This is that gate, in the mould of the
+    prompt/code alphabet pins: it lifts the expression out of the source and demands every
+    prose site quote it verbatim, so a change to the verdict turns the prose red instead of
+    leaving it to rot.
+    """
+    from cogno_synapse import key_probe
+
+    src = pathlib.Path(key_probe.__file__).read_text(encoding="utf-8")
+    verdict = re.search(r"^\s*return resp\.status_code\s+(.+?)\s*$", src, re.M)
+    assert verdict, (
+        "the verdict is no longer a single `return resp.status_code <expr>` line — move this "
+        "pin to wherever it went, and update every prose site in the same commit"
+    )
+    quoted = f"status_code {verdict.group(1)}"
+
+    readme = pathlib.Path(__file__).resolve().parents[2] / "README.md"
+    assert readme.is_file(), f"README not found at {readme}"
+    for name, text in (("module docstring", key_probe.__doc__ or ""),
+                       ("function docstring", probe_api_key.__doc__ or ""),
+                       ("README", readme.read_text(encoding="utf-8"))):
+        assert quoted in text, f"{name} does not quote the verdict the code runs: {quoted!r}"
