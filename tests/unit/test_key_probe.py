@@ -2,10 +2,10 @@
 
 Two properties are worth protecting here and they fail in opposite directions:
 
-* the **bias**, which splits in two and is fail-open on only one half — our own inability to
-  reach the provider says "valid", but every error status a provider we DID reach sent back
-  says "invalid", a 429 and a 500 included (the verdict is ``status_code < 400``). That
-  second half is pinned below as MEASURED behaviour, not as a design anyone argued for;
+* the **bias** — only a statement the provider made about THIS CREDENTIAL (401/403), or a
+  blank key, says "invalid"; every other outcome is inconclusive and says "valid", a 429, a
+  5xx and a 404 included. The blast radius of that rule is not described here but SWEPT, over
+  every status 100–599, against the rule it replaced;
 * the **dialect** — each provider is handed the key the way IT reads keys. A dialect bug is
   the quiet one: the request goes out unauthenticated, the provider answers 401, and a
   perfectly good key is branded invalid for every user of that provider. So the dialect is
@@ -14,6 +14,7 @@ Two properties are worth protecting here and they fail in opposite directions:
 
 from __future__ import annotations
 
+import logging
 import pathlib
 import re
 
@@ -64,7 +65,10 @@ async def test_a_2xx_says_the_key_is_live(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_an_auth_rejection_invalidates(monkeypatch):
+async def test_an_auth_rejection_is_the_only_status_that_invalidates(monkeypatch):
+    """The half of the old rule that SURVIVES. It is also the half the dialect tests lean on:
+    a dialect bug sends the request out with no credential, the provider answers 401, and the
+    key reads dead — so 401 must keep meaning what it means, or that cover goes with it."""
     _patch(monkeypatch, status=401)
     assert await probe_api_key("openai", "sk-bad") is False
     _patch(monkeypatch, status=403)
@@ -72,23 +76,78 @@ async def test_an_auth_rejection_invalidates(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [429, 500, 502, 503])
-async def test_an_error_status_from_a_reached_provider_also_invalidates(monkeypatch, status):
-    """MEASURED behaviour, pinned so it cannot drift in silence again.
+@pytest.mark.parametrize("status", [400, 402, 404, 408, 422, 429, 500, 502, 503, 504])
+async def test_an_inconclusive_status_never_brands_a_key_dead(monkeypatch, status):
+    """A status that is not a statement about THIS CREDENTIAL must not invalidate it.
 
-    The verdict is ``status_code < 400``, so a rate limit and a provider outage brand the key
-    invalid exactly as an auth rejection does. Nothing asserted this before, which is how the
-    module docstring and the README came to claim the opposite of the code while the function
-    docstring claimed the truth — three statements of one rule, two of them wrong, and no test
-    to referee them.
+    A 429 is a rate limit on our IP or their account, a 5xx is their infrastructure, a 404 is
+    OUR probe URL — none of them says anything about the key, so none of them may kill it. The
+    two errors are not symmetric: a false *invalid* takes a working provider away from a paying
+    tenant and, in the one caller that exists, never heals (it probes on save and never again);
+    a false *valid* leaves a dead key looking alive until its first real call fails, which the
+    caller sees and can act on.
 
-    Whether this is the RIGHT bias is a separate question and deliberately not settled here:
-    changing it is a behaviour change, and this file's job today is to say what the behaviour
-    IS. The sharp edge, for whoever takes that question up, is 429 — a rate limit arrives
-    precisely when a key is being used hard, i.e. when it is most demonstrably alive.
+    The two entries that cost the most are named so nobody has to rediscover them: **402** is a
+    real key on an unpaid account — authentic, and unusable — and it now reads live; **404** is
+    a rotted probe URL, which waves through every key of that provider unprobed. Both are
+    accepted, and both are why this branch logs (see the twin below).
     """
     _patch(monkeypatch, status=status)
-    assert await probe_api_key("openai", "sk-live-but-throttled") is False
+    assert await probe_api_key("openai", "sk-live-but-throttled") is True
+
+
+@pytest.mark.asyncio
+async def test_the_new_bias_changes_exactly_the_statuses_it_says_it_changes(monkeypatch):
+    """The over-tightening probe, swept status by status over the WHOLE corpus (100–599).
+
+    The old rule was ``status_code < 400``; the new one is ``status_code not in (401, 403)``.
+    Widening a predicate has victims, so the difference is enumerated here rather than
+    described: everything from 400 up EXCEPT the two credential rejections now reads valid
+    where it used to read dead, and *nothing else moves* — no 2xx and no 3xx changes hands.
+    An edit that widens or narrows that set (exempting a 402, letting a 400 invalidate again)
+    fails here by name instead of being left for a reader to notice.
+    """
+    client = _patch(monkeypatch, status=200)
+    changed = set()
+    for status in range(100, 600):
+        client._status = status
+        was_valid = status < 400                       # the rule this PR replaces, frozen
+        if (await probe_api_key("openai", "sk-x")) != was_valid:
+            changed.add(status)
+    assert changed == set(range(400, 600)) - {401, 403}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [404, 429, 500])
+async def test_the_waived_statuses_are_logged_so_a_rotted_probe_url_is_not_silent(
+        monkeypatch, caplog, status):
+    """Fail-open on the VERDICT must not mean fail-silent on the SIGNAL.
+
+    Before this change a rotted probe URL was loud in the worst way — every key of that
+    provider read invalid, so somebody filed a bug. Now it reads valid, which is the right
+    verdict and the wrong amount of noise: without this line the probe would quietly become a
+    no-op for that provider and nobody would ever learn. The verdict fails open; the record
+    does not disappear.
+    """
+    _patch(monkeypatch, status=status)
+    with caplog.at_level(logging.WARNING, logger="cogno_synapse.key_probe"):
+        assert await probe_api_key("openai", "sk-x") is True
+    waivers = [r.getMessage() for r in caplog.records if "byok_probe_inconclusive" in r.getMessage()]
+    assert waivers, "the waived status was not recorded anywhere"
+    # the STATUS travels too — "something was waived" without saying what is not a signal.
+    assert any(f"status={status}" in m for m in waivers)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,why", [(200, "a clean pass has nothing to report"),
+                                        (401, "a rejection is a verdict, not a waiver")])
+async def test_nothing_but_a_waiver_is_logged_as_inconclusive(monkeypatch, caplog, status, why):
+    """The twin of the test above: without it, a log line emitted on EVERY response would
+    satisfy that one and say nothing. ``inconclusive`` has to mean the branch that waived."""
+    _patch(monkeypatch, status=status)
+    with caplog.at_level(logging.WARNING, logger="cogno_synapse.key_probe"):
+        await probe_api_key("openai", "sk-x")
+    assert not any("byok_probe_inconclusive" in r.getMessage() for r in caplog.records), why
 
 
 @pytest.mark.asyncio

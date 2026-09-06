@@ -9,20 +9,26 @@ Every provider offers the same cheap shape: an authenticated GET that costs noth
 (list-models, or ``/user``). This module is that one call plus the per-provider auth dialect
 (``Authorization: Bearer``, ``x-api-key``, a ``key`` query parameter, ``xi-api-key``).
 
-**The bias splits in two, and only the first half is fail-open.** *Reaching* the provider
-fails open: a timeout, DNS down, or a provider this table cannot probe → **valid**, because
-our failure to reach a provider is not evidence about their key, and a wrongly-invalidated
-key locks a paying user out of their own models with no way to tell why. What the provider
-*said* fails closed: the verdict is ``status_code < 400``, so a 401 and a 403 invalidate —
-and so, equally, do a 429 and a 500.
+**The bias is fail-OPEN, and the line it draws is "did the provider make a statement about
+THIS CREDENTIAL?"** Only a 401 and a 403 do: the verdict is ``status_code not in (401, 403)``.
+Everything else is *inconclusive*, and inconclusive reads as **valid** — a timeout, DNS down,
+a provider this table cannot probe, and equally a 429, a 500 or a 404 from a provider we did
+reach. A 429 is a rate limit on our IP or their account, a 5xx is their infrastructure, a 404
+is *our* URL: none of the three is evidence about the key, and a wrongly-invalidated key locks
+a paying user out of their own models with no way to tell why.
 
-That second half is **measured, not designed**, and it is stated here because the prose
-around it used to claim the opposite. Whether a rate limit or a provider outage ought to
-brand a key dead is a real question — a 429 in particular arrives exactly when the key is
-being used hard, which is when it is most demonstrably alive — but it is a question about
-behaviour, and this docstring's job is to describe the behaviour there is. Both statuses are
-pinned in ``tests/unit/test_key_probe.py`` so the answer cannot change without someone
-choosing to change it.
+The asymmetry is deliberate, because the two errors do not cost the same. A false *invalid*
+takes a working provider away from a paying tenant; a false *valid* leaves a dead key looking
+alive until its first real call fails. Only the first of those is silent to the user who could
+fix it, and — measured in the one caller that exists — only the first is **permanent**: that
+caller probes on save and never again, so a spurious rejection never heals on its own.
+
+What this bias gives up is stated rather than hidden: a rotted probe URL (404) and an auth
+dialect a provider answers with a 400 rather than a 401 now read as valid, i.e. quietly
+unprobed. So the inconclusive branch **logs** (``event=byok_probe_inconclusive``) — the
+verdict fails open, the signal does not disappear — and the dialect assertions in
+``tests/unit/test_key_probe.py``, which check the request that was BUILT rather than the
+boolean that came back, become the load-bearing cover for that half.
 
 The one thing that is never trusted is a *blank* key: "unverifiable" is not "empty".
 
@@ -85,10 +91,11 @@ async def probe_api_key(
     ``probes`` overrides the shipped :data:`API_KEY_PROBES` table (pass
     ``{**API_KEY_PROBES, "myprovider": (url, "bearer")}`` to extend it).
 
-    Returns ``False`` for a blank key, and for any error status from a provider we did
-    reach — 401/403, and equally 429/5xx, because the verdict is ``status_code < 400``. A
-    provider this table cannot probe, or a transport error, returns ``True`` for a non-empty
-    key. Only the second of those two is fail-open; see the module docstring."""
+    Returns ``False`` for a blank key and for a credential the provider actively rejected —
+    and nothing else: the verdict is ``status_code not in (401, 403)``. Every other outcome is
+    inconclusive and reads ``True`` for a non-empty key: a transport error, a provider this
+    table cannot probe, and any other status, a 429/404/5xx included (those are logged as
+    ``event=byok_probe_inconclusive``). See the fail-open bias in the module docstring."""
     table = API_KEY_PROBES if probes is None else probes
     spec = table.get((provider or "").lower())
     if spec is None or not api_key:
@@ -101,6 +108,10 @@ async def probe_api_key(
     except Exception as exc:  # noqa: BLE001 — a network error must not brand a legit key invalid
         log.warning("event=byok_probe_error provider=%s error=%s — treating as valid", provider, exc)
         return True
-    if resp.status_code in (401, 403):
-        return False
-    return resp.status_code < 400
+    if resp.status_code >= 400 and resp.status_code not in (401, 403):
+        # Inconclusive, not a rejection — but this branch now WAIVES the key, so it must not be
+        # silent: a 404 here means the probe URL rotted and every key of this provider is being
+        # waved through unprobed, which is exactly the failure a quiet fail-open would hide.
+        log.warning("event=byok_probe_inconclusive provider=%s status=%s — treating as valid",
+                    provider, resp.status_code)
+    return resp.status_code not in (401, 403)
