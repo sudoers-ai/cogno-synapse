@@ -29,6 +29,27 @@ pip install "cogno-synapse[llm]"                # all cloud SDKs
 
 `CachingEmbedder` wraps any `Embedder` with a bounded LRU + token accounting (`EmbeddingUsage`). `parse_tool_calls_from_text` reads `<TOOL_CALL>` tags for the text-fallback function-calling path (and rescues FC leaks).
 
+## BYOK — is this key live?
+
+`probe_api_key(provider, api_key)` answers the one question a bring-your-own-key console has to
+answer the moment a key is pasted, with a cost-free authenticated GET (list-models, or `/user`)
+in that provider's own auth dialect:
+
+```python
+from cogno_synapse import API_KEY_PROBES, probe_api_key
+
+live = await probe_api_key("anthropic", key)                      # shipped table
+live = await probe_api_key("myprovider", key,                     # …or your own
+                           probes={**API_KEY_PROBES, "myprovider": (url, "bearer")})
+```
+
+The bias is **fail-open**: only a real rejection (401/403, or any other error status from a
+provider we did reach) — or a *blank* key — reads as invalid. A 5xx, a timeout, DNS down or a
+provider the table cannot probe all read as valid, because our failure to reach a provider is
+not evidence about their key, and a wrongly-invalidated key locks a paying user out of their
+own models. `API_KEY_PROBES` is exported so the caller can pin its own provider list against
+it; which providers you offer is yours to decide, not this library's.
+
 ## Resilient fallback — over `cogno-homeo`
 
 `FallbackBackend` tries an ordered chain, first success wins, last error propagates. The loop runs on [`cogno-homeo`](https://github.com/sudoers-ai/cogno-homeo)'s `resilient_call`, so you can opt into a circuit breaker, retry/backoff, and a metrics seam — with none supplied it behaves like the historical "try each once" chain:
