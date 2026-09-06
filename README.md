@@ -43,12 +43,14 @@ live = await probe_api_key("myprovider", key,                     # …or your o
                            probes={**API_KEY_PROBES, "myprovider": (url, "bearer")})
 ```
 
-The bias is **fail-open**: only a real rejection (401/403, or any other error status from a
-provider we did reach) — or a *blank* key — reads as invalid. A 5xx, a timeout, DNS down or a
-provider the table cannot probe all read as valid, because our failure to reach a provider is
-not evidence about their key, and a wrongly-invalidated key locks a paying user out of their
-own models. `API_KEY_PROBES` is exported so the caller can pin its own provider list against
-it; which providers you offer is yours to decide, not this library's.
+The bias splits in two, and only one half is fail-open. **Reaching** the provider fails open: a
+timeout, DNS down, or a provider the table cannot probe all read as **valid**, because our
+failure to reach a provider is not evidence about their key, and a wrongly-invalidated key
+locks a paying user out of their own models. What the provider **said** fails closed: the
+verdict is `status_code < 400`, so a 429 and a 5xx read as **invalid** exactly like a 401 does.
+A *blank* key is never trusted either way. `API_KEY_PROBES` is exported so the caller can pin
+its own provider list against it; which providers you offer is yours to decide, not this
+library's.
 
 ## Resilient fallback — over `cogno-homeo`
 
