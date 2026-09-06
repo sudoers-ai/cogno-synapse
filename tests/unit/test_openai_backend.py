@@ -231,3 +231,164 @@ async def test_the_conflict_is_learned_once_not_rediscovered_every_step():
 
     assert len(seen) == 4, f"expected 2 calls then 1 each, got {len(seen)}"
     assert all("reasoning_effort" in c for c in seen[1:])
+
+
+# ── the prompt cache the provider already gives us and nobody read ────────────────────────
+#
+# Measured live 2026-09-03: a second call with the same prefix reported cached 2432 of 2625
+# prompt tokens (92.6%). `prompt_tokens_details.cached_tokens` was read NOWHERE in the stack,
+# so the meter priced every EGO correction retry as a fresh prompt.
+
+class _CachedResp:
+    """A successful text response whose usage carries a cached-prompt block."""
+
+    def __init__(self, cached=2432, prompt=2625, details=True) -> None:
+        self.choices = [_Choice("stop", "hello")]
+        u = type("U", (), {"prompt_tokens": prompt, "completion_tokens": 7})()
+        if details is True:
+            u.prompt_tokens_details = type("D", (), {"cached_tokens": cached})()
+        elif details == "dict":
+            u.prompt_tokens_details = {"cached_tokens": cached}
+        elif details == "garbage":
+            u.prompt_tokens_details = type("D", (), {"cached_tokens": "many"})()
+        self.usage = u
+
+
+def _client_returning(resp, record=None):
+    class _Completions:
+        async def create(self, **kw):
+            if record is not None:
+                record.append(kw)
+            if isinstance(resp, Exception):
+                raise resp
+            return resp
+
+    class _Client:
+        chat = type("Chat", (), {"completions": _Completions()})()
+
+        async def close(self):
+            return None
+
+    return _Client
+
+
+@pytest.mark.parametrize("details, expected", [
+    (True, 2432),          # the shape the OpenAI SDK returns
+    ("dict", 2432),        # an OpenAI-COMPATIBLE endpoint handing back a plain dict
+    (False, 0),            # no block at all — "unknown", priced at the full rate as before
+    ("garbage", 0),        # a non-numeric count must degrade, never raise
+])
+@pytest.mark.asyncio
+async def test_generate_reports_the_cached_prompt_tokens(details, expected):
+    from cogno_synapse import cached_tokens_of
+    from cogno_synapse.openai_backend import OpenAIBackend
+
+    b = OpenAIBackend(model="gpt-4o-mini", api_key="sk-x")
+    b._client = _client_returning(_CachedResp(details=details))  # type: ignore[method-assign]
+    text, tin, tout = await b.generate("sys", "hi")
+    assert (text, tin, tout) == ("hello", 2625, 7)
+    assert cached_tokens_of(b) == expected
+
+
+@pytest.mark.asyncio
+async def test_the_cached_count_is_a_SUBSET_of_the_prompt_tokens_it_is_reported_with():
+    """The whole arithmetic downstream is ``fresh = tokens_in - cached``. If this number were
+    an EXTRA (the Anthropic shape) rather than a part, the meter would price a negative
+    prompt. Pinned here, where the provider's shape is known, not four repos away."""
+    from cogno_synapse import cached_tokens_of
+    from cogno_synapse.openai_backend import OpenAIBackend
+
+    b = OpenAIBackend(model="gpt-4o-mini", api_key="sk-x")
+    b._client = _client_returning(_CachedResp())  # type: ignore[method-assign]
+    _, tokens_in, _ = await b.generate("sys", "hi")
+    assert 0 < cached_tokens_of(b) <= tokens_in
+
+
+@pytest.mark.asyncio
+async def test_a_call_that_reports_no_cache_does_not_inherit_the_previous_calls_count():
+    """The value is per CALL. A stale one is worse than none: it would hand the meter a
+    discount for a prompt the provider charged in full."""
+    from cogno_synapse import cached_tokens_of
+    from cogno_synapse.openai_backend import OpenAIBackend
+
+    b = OpenAIBackend(model="gpt-4o-mini", api_key="sk-x")
+    b._client = _client_returning(_CachedResp())  # type: ignore[method-assign]
+    await b.generate("sys", "hi")
+    assert cached_tokens_of(b) == 2432
+    b._client = _client_returning(_CachedResp(details=False))  # type: ignore[method-assign]
+    await b.generate("sys", "hi")
+    assert cached_tokens_of(b) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_FAILED_call_leaves_no_cached_count_behind():
+    """A raise must clear it too, or the next successful call is billed at the previous
+    one's discount."""
+    from cogno_synapse import cached_tokens_of
+    from cogno_synapse.openai_backend import OpenAIBackend
+
+    b = OpenAIBackend(model="gpt-4o-mini", api_key="sk-x")
+    b._client = _client_returning(_CachedResp())  # type: ignore[method-assign]
+    await b.generate("sys", "hi")
+    b._client = _client_returning(RuntimeError("boom"))  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError):
+        await b.generate("sys", "hi")
+    assert cached_tokens_of(b) == 0
+
+
+@pytest.mark.asyncio
+async def test_chat_with_tools_reports_it_too():
+    """The EGO's correction retries are the measured case, and they go through the TOOL path.
+    Reporting it only on ``generate`` would miss the money."""
+    from cogno_synapse import cached_tokens_of
+    from cogno_synapse.openai_backend import OpenAIBackend
+
+    resp = _ToolResp()
+    resp.usage = type("U", (), {
+        "prompt_tokens": 3874, "completion_tokens": 18,
+        "prompt_tokens_details": type("D", (), {"cached_tokens": 3584})()})()
+    b = OpenAIBackend(model="gpt-4o-mini", api_key="sk-x")
+    b._client = _client_returning(resp)  # type: ignore[method-assign]
+    msg, tin, tout = await b.chat_with_tools([{"role": "user", "content": "hi"}], [])
+    assert tin == 3874 and len(msg["tool_calls"]) == 1
+    assert cached_tokens_of(b) == 3584
+
+
+def test_a_backend_that_reports_nothing_answers_zero_not_an_error():
+    """Ollama, a stub, the distilled student: silence is 0, and 0 downstream means FULL price
+    — the old behaviour. The helper must never be the thing that breaks a turn."""
+    from cogno_synapse import cached_tokens_of
+
+    assert cached_tokens_of(object()) == 0
+    assert cached_tokens_of(type("B", (), {"last_cached_tokens": None})()) == 0
+    assert cached_tokens_of(type("B", (), {"last_cached_tokens": -9})()) == 0
+    assert cached_tokens_of(type("B", (), {"last_cached_tokens": 12})()) == 12
+
+
+@pytest.mark.asyncio
+async def test_a_fallback_chain_answers_for_the_link_that_actually_ran():
+    """``FallbackBackend`` already forwards ``model`` from the successful backend; the cache
+    count has to travel the same way or the ledger pairs one backend's model with another
+    backend's (or with no) cache count."""
+    from cogno_synapse import FallbackBackend, cached_tokens_of
+
+    class _Dead:
+        model = "dead"
+        last_cached_tokens = 999
+
+        async def generate(self, system, prompt):
+            raise RuntimeError("down")
+
+    class _Live:
+        model = "gpt-4o-mini"
+        last_cached_tokens = 0
+
+        async def generate(self, system, prompt):
+            self.last_cached_tokens = 2432
+            return "ok", 2625, 7
+
+    chain = FallbackBackend([_Dead(), _Live()])
+    assert cached_tokens_of(chain) == 0          # nothing has run yet
+    assert await chain.generate("s", "p") == ("ok", 2625, 7)
+    assert chain.model == "gpt-4o-mini"
+    assert cached_tokens_of(chain) == 2432
