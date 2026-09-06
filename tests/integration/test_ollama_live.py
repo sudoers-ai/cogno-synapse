@@ -100,11 +100,23 @@ async def test_embed_with_usage_reports_tokens():
     emb = OllamaEmbedder(model=EMBED_MODEL, base_url=BASE_URL)
     vec, tokens = await emb.embed_with_usage("usage accounting check")
     assert len(vec) > 0
-    # Token count is sourced from Ollama's prompt_eval_count, which the
-    # /api/embeddings endpoint does NOT report for every model/build (it returns
-    # 0 there). The contract is the (vector, tokens) shape with tokens >= 0; the
-    # host should not rely on Ollama embedding token counts being non-zero.
-    assert tokens >= 0
+    # ``> 0``, and the loosening is the point. This assertion used to be ``>= 0``, with a
+    # comment telling the host "not to rely on Ollama embedding token counts being non-zero"
+    # — and that comment was TRUE, for the reason the client has now stopped giving it: it
+    # posted to the LEGACY ``/api/embeddings``, whose entire response is the vector. The test
+    # was not wrong about the behaviour; it had written the defect down as a contract, and
+    # ``>= 0`` passes whatever happens, so nothing could ever fail.
+    #
+    # Measured against a live Ollama 0.20.0 on 2026-09-06: ``/api/embed`` returns
+    # ``prompt_eval_count`` (17 for a one-line Portuguese sentence). The consequence in
+    # production was four fields with no writer — ``embedding_tokens`` was 0 in 134 of 134
+    # traces, and the ledger had zero rows for ``noumeno``/``id`` across its whole history.
+    #
+    # This test is gated on a REACHABLE Ollama, so it is measuring THIS server. A box too old
+    # for the endpoint (pre-0.2) falls back and would legitimately report 0 — the unit suite
+    # owns that path (`test_ollama_embedder_endpoint.py`); here we assert the modern one.
+    assert tokens > 0, ("this Ollama reported no prompt_eval_count — either it predates "
+                        "/api/embed (0.2) or the client fell back to the legacy endpoint")
     assert isinstance(tokens, int)
 
 

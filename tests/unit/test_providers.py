@@ -217,13 +217,21 @@ async def test_ollama_backend_is_available(monkeypatch):
     monkeypatch.setattr(httpx.AsyncClient, "get", mock_get_fail)
     assert await backend.is_available() is False
 
+# The three mocks below carried the SHAPE of ``/api/embeddings`` — ``{"embedding": [...]}``,
+# singular — and one of them added a ``prompt_eval_count`` to it. That key is not in that
+# endpoint's response and never has been: measured against a live Ollama 0.20.0 on 2026-09-06,
+# ``/api/embeddings`` answers ``{"embedding": [768 floats]}`` and nothing else. So the token
+# assertion was green against a payload production could not produce, while the real
+# ``embedding_tokens`` was 0 in 134 of 134 traces. The shapes here are now the MEASURED ones
+# (see ``tests/unit/test_ollama_embedder_endpoint.py`` for the endpoint contract in full).
+
 @pytest.mark.asyncio
 async def test_ollama_embedder_success(monkeypatch):
     """Successful embed returns the embedding vector (OllamaEmbedder is stateless)."""
     class MockResponse:
         status_code = 200
         def json(self):
-            return {"embedding": [0.1, 0.2, 0.3]}
+            return {"embeddings": [[0.1, 0.2, 0.3]], "prompt_eval_count": 5}
         def raise_for_status(self):
             pass
 
@@ -239,11 +247,11 @@ async def test_ollama_embedder_success(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_ollama_embedder_reports_token_usage(monkeypatch):
-    """embed_with_usage surfaces Ollama's prompt_eval_count as embedding tokens."""
+    """``embed_with_usage`` surfaces ``/api/embed``'s ``prompt_eval_count``."""
     class MockResponse:
         status_code = 200
         def json(self):
-            return {"embedding": [0.1, 0.2], "prompt_eval_count": 7}
+            return {"embeddings": [[0.1, 0.2]], "prompt_eval_count": 7}
         def raise_for_status(self):
             pass
 
@@ -263,11 +271,16 @@ async def test_ollama_embedder_reports_token_usage(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_ollama_embedder_token_usage_defaults_zero(monkeypatch):
-    """Older Ollama builds omit prompt_eval_count → tokens default to 0."""
+    """A response without the count degrades to 0 rather than raising.
+
+    The old docstring said "older Ollama builds omit prompt_eval_count", which put the
+    VERSION on the wrong axis: what omitted it was the legacy ENDPOINT, on every version.
+    An old *server* is a different case — it has no ``/api/embed`` at all — and it is covered
+    by ``test_a_server_without_the_endpoint_falls_back_instead_of_failing``."""
     class MockResponse:
         status_code = 200
         def json(self):
-            return {"embedding": [0.1, 0.2]}
+            return {"embeddings": [[0.1, 0.2]]}
         def raise_for_status(self):
             pass
 
