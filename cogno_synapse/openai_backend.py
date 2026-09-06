@@ -61,6 +61,31 @@ def _wants_json(system: str) -> bool:
     return "json" in (system or "").lower()
 
 
+def _cached_prompt_tokens(usage: object) -> int:
+    """The part of ``prompt_tokens`` OpenAI served from its own prompt cache, or 0.
+
+    ``usage.prompt_tokens_details.cached_tokens``. It is a SUBSET of ``prompt_tokens`` (not an
+    extra amount), which is what lets a meter price it separately — measured live 2026-09-03,
+    a second call with the same prefix reported 2432 cached of 2625.
+
+    Reads defensively and never raises: an OpenAI-COMPATIBLE endpoint reached through
+    ``base_url`` (DeepSeek, Moonshot, OpenRouter, …) may omit the block entirely or name its
+    counter something else, and a missing count must degrade to 0 — priced at the full input
+    rate, exactly as before — not take the turn down.
+    """
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details is None:
+        return 0
+    if isinstance(details, dict):          # some compatible SDKs hand back a plain dict
+        value = details.get("cached_tokens", 0)
+    else:
+        value = getattr(details, "cached_tokens", 0)
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _is_auth_error(exc: Exception) -> bool:
     if type(exc).__name__ in ("AuthenticationError", "PermissionDeniedError"):
         return True
@@ -98,6 +123,11 @@ class OpenAIBackend:
         # reuses one backend across 5–8 steps plus correction retries. Rediscovering the
         # conflict each time buys nothing and costs a full failed round-trip per step.
         self._tools_need_effort_none = False
+        # Prompt tokens the provider served from its own cache on the LAST call — 0 until one
+        # runs, and reset to 0 at the top of every call so a raised request can never leave a
+        # stale number for the next one to be billed by. Read it through
+        # ``cogno_synapse.cached_tokens_of``; the contract for reading it safely is there.
+        self.last_cached_tokens = 0
         if not self.api_key:
             logger.warning("OPENAI_API_KEY not set — OpenAI calls will fail")
 
@@ -162,12 +192,14 @@ class OpenAIBackend:
         if _wants_json(system) and self._supports_json_mode():
             kwargs["response_format"] = {"type": "json_object"}
         log_request(logger, "openai", self.model, system, prompt)
+        self.last_cached_tokens = 0
         try:
             t0 = time.perf_counter()
             resp = await client.chat.completions.create(**kwargs)
             usage = resp.usage
             tokens_in = usage.prompt_tokens if usage else 0
             tokens_out = usage.completion_tokens if usage else 0
+            self.last_cached_tokens = _cached_prompt_tokens(usage)
             log_done(logger, "openai", self.model, t0, tokens_in, tokens_out)
             # A cut response is indistinguishable from a complete one at this layer — same
             # shape, same type, no exception — so it travels on and fails much later, where
@@ -197,6 +229,7 @@ class OpenAIBackend:
         self, messages: list[dict], tools: list[dict], tool_choice=None,
     ) -> tuple[dict, int, int]:
         client = self._client()
+        self.last_cached_tokens = 0
         kwargs: dict = {"model": self.model, "messages": messages, **self._token_limit_kwargs()}
         if tools:
             kwargs["tools"] = tools
@@ -236,6 +269,7 @@ class OpenAIBackend:
             usage = resp.usage
             tokens_in = usage.prompt_tokens if usage else 0
             tokens_out = usage.completion_tokens if usage else 0
+            self.last_cached_tokens = _cached_prompt_tokens(usage)
             _warn_if_truncated(resp, self.model)
             result: dict = {"content": msg.content or ""}
             if msg.tool_calls:

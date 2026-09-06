@@ -77,3 +77,16 @@ class FallbackBackend:
     def model(self) -> str:
         active = self._last_successful or self.backends[0]
         return getattr(active, "model", "unknown")
+
+    @property
+    def last_cached_tokens(self) -> int:
+        """Forwarded from the backend that actually ran, like ``model`` beside it.
+
+        A chain answers for the link that served the call. Without this the ledger would
+        attribute the SECOND backend's model to the FIRST one's cache count — or, worse,
+        report 0 for a call the provider did discount, because the wrapper has no attribute
+        of its own and ``cached_tokens_of`` would fall through to its default.
+
+        Read through ``cogno_synapse.cached_tokens_of``, immediately after the await."""
+        active = self._last_successful
+        return max(0, int(getattr(active, "last_cached_tokens", 0) or 0)) if active else 0
