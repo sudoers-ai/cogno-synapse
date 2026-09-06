@@ -9,12 +9,22 @@ Every provider offers the same cheap shape: an authenticated GET that costs noth
 (list-models, or ``/user``). This module is that one call plus the per-provider auth dialect
 (``Authorization: Bearer``, ``x-api-key``, a ``key`` query parameter, ``xi-api-key``).
 
-**The bias is deliberate and it is fail-OPEN.** A clear auth rejection (401/403) → invalid;
-a 2xx → valid; anything else — a 5xx, a timeout, DNS down, an unknown provider — → **valid**.
-Our failure to reach a provider must never brand a legitimate key invalid: the key is
-re-checked for real the first time it is actually used, and a wrongly-invalidated key locks a
-paying user out of their own models with no way to tell why. The one thing that is never
-trusted is a *blank* key: "unverifiable" is not "empty".
+**The bias splits in two, and only the first half is fail-open.** *Reaching* the provider
+fails open: a timeout, DNS down, or a provider this table cannot probe → **valid**, because
+our failure to reach a provider is not evidence about their key, and a wrongly-invalidated
+key locks a paying user out of their own models with no way to tell why. What the provider
+*said* fails closed: the verdict is ``status_code < 400``, so a 401 and a 403 invalidate —
+and so, equally, do a 429 and a 500.
+
+That second half is **measured, not designed**, and it is stated here because the prose
+around it used to claim the opposite. Whether a rate limit or a provider outage ought to
+brand a key dead is a real question — a 429 in particular arrives exactly when the key is
+being used hard, which is when it is most demonstrably alive — but it is a question about
+behaviour, and this docstring's job is to describe the behaviour there is. Both statuses are
+pinned in ``tests/unit/test_key_probe.py`` so the answer cannot change without someone
+choosing to change it.
+
+The one thing that is never trusted is a *blank* key: "unverifiable" is not "empty".
 
 The default table covers the providers a BYOK console usually offers, which is not the same
 list as the providers :mod:`cogno_synapse.factory` can build a backend for — a voice provider
@@ -75,10 +85,10 @@ async def probe_api_key(
     ``probes`` overrides the shipped :data:`API_KEY_PROBES` table (pass
     ``{**API_KEY_PROBES, "myprovider": (url, "bearer")}`` to extend it).
 
-    Returns ``False`` only for a blank key or a provider that actively rejected it (401/403,
-    or any other 4xx/5xx from a provider we did reach). A provider this table cannot probe, or
-    a transport error, returns ``True`` for a non-empty key — see the fail-open bias in the
-    module docstring."""
+    Returns ``False`` for a blank key, and for any error status from a provider we did
+    reach — 401/403, and equally 429/5xx, because the verdict is ``status_code < 400``. A
+    provider this table cannot probe, or a transport error, returns ``True`` for a non-empty
+    key. Only the second of those two is fail-open; see the module docstring."""
     table = API_KEY_PROBES if probes is None else probes
     spec = table.get((provider or "").lower())
     if spec is None or not api_key:
