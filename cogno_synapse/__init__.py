@@ -36,6 +36,7 @@ from cogno_synapse.gemini_backend import GeminiBackend
 from cogno_synapse.bedrock_backend import BedrockBackend
 from cogno_synapse.fallback import FallbackBackend
 from cogno_synapse.factory import create_backend, create_embedder, parse_model_string
+from cogno_synapse.key_probe import API_KEY_PROBES, probe_api_key
 from cogno_synapse.errors import SynapseError, MissingAPIKeyError, InvalidAPIKeyError, EmbeddingResponseError
 
 __all__ = [
@@ -59,6 +60,8 @@ __all__ = [
     "create_backend",
     "create_embedder",
     "parse_model_string",
+    "API_KEY_PROBES",
+    "probe_api_key",
     "SynapseError",
     "MissingAPIKeyError",
     "InvalidAPIKeyError",
