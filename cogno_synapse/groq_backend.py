@@ -15,7 +15,7 @@ import logging
 
 from cogno_synapse.errors import InvalidAPIKeyError
 from cogno_synapse.tool_parsing import parse_tool_calls_from_text
-from cogno_synapse.openai_backend import _openai_tool_call, _safe_close
+from cogno_synapse.openai_backend import _openai_tool_call, _provider_string, _safe_close
 from cogno_synapse._obs import log_done, log_request, warn_if_retryable
 
 logger = logging.getLogger("cogno_synapse.groq")
@@ -44,6 +44,12 @@ class GroqBackend:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.timeout = timeout
+        # Groq's response is OpenAI-shaped and carries ``system_fingerprint`` too, so the same
+        # question ("did the backend under this alias change between these two calls?") is
+        # answerable here. None until a call runs, reset at the top of every call so a raised
+        # request leaves no stale identifier. Read via ``cogno_synapse.system_fingerprint_of``.
+        self.last_system_fingerprint: str | None = None
+        self.last_served_model: str | None = None
         if not self.api_key:
             logger.warning("GROQ_API_KEY not set — Groq calls will fail")
 
@@ -65,12 +71,16 @@ class GroqBackend:
         if self.temperature is not None:
             kwargs["temperature"] = self.temperature
         log_request(logger, "groq", self.model, system, prompt)
+        self.last_system_fingerprint = None
+        self.last_served_model = None
         try:
             t0 = time.perf_counter()
             resp = await client.chat.completions.create(**kwargs)
             usage = resp.usage
             tokens_in = usage.prompt_tokens if usage else 0
             tokens_out = usage.completion_tokens if usage else 0
+            self.last_system_fingerprint = _provider_string(resp, "system_fingerprint")
+            self.last_served_model = _provider_string(resp, "model")
             log_done(logger, "groq", self.model, t0, tokens_in, tokens_out)
             return (resp.choices[0].message.content or "", tokens_in, tokens_out)
         except Exception as exc:
@@ -89,10 +99,14 @@ class GroqBackend:
             kwargs["tool_choice"] = tool_choice
         if self.temperature is not None:
             kwargs["temperature"] = self.temperature
+        self.last_system_fingerprint = None
+        self.last_served_model = None
         try:
             resp = await client.chat.completions.create(**kwargs)
             msg = resp.choices[0].message
             usage = resp.usage
+            self.last_system_fingerprint = _provider_string(resp, "system_fingerprint")
+            self.last_served_model = _provider_string(resp, "model")
             result: dict = {"content": msg.content or ""}
             if msg.tool_calls:
                 result["tool_calls"] = [_openai_tool_call(tc) for tc in msg.tool_calls]

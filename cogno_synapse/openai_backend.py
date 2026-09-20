@@ -86,6 +86,28 @@ def _cached_prompt_tokens(usage: object) -> int:
         return 0
 
 
+def _provider_string(resp: object, attribute: str) -> str | None:
+    """A per-call identifier the provider stamped on the response, or ``None``.
+
+    Serves ``system_fingerprint`` (which backend configuration answered) and ``model`` (which
+    snapshot the alias resolved to). Both are read the SAME way and degrade the same way,
+    because both are only ever compared to the value from another call.
+
+    Defensive, exactly like ``_cached_prompt_tokens`` above and for the same reason: an
+    OpenAI-COMPATIBLE endpoint reached through ``base_url`` usually omits ``system_fingerprint``
+    entirely, and a missing identifier must read as "the provider did not say" — never take the
+    turn down. A blank or whitespace-only echo is also ``None``: two blanks comparing equal
+    would claim two calls shared a backend when neither named one.
+    """
+    if isinstance(resp, dict):          # some compatible SDKs hand back a plain dict
+        value = resp.get(attribute)
+    else:
+        value = getattr(resp, attribute, None)
+    if not isinstance(value, str):
+        return None
+    return value.strip() or None
+
+
 def _is_auth_error(exc: Exception) -> bool:
     if type(exc).__name__ in ("AuthenticationError", "PermissionDeniedError"):
         return True
@@ -128,6 +150,15 @@ class OpenAIBackend:
         # stale number for the next one to be billed by. Read it through
         # ``cogno_synapse.cached_tokens_of``; the contract for reading it safely is there.
         self.last_cached_tokens = 0
+        # The provider's identifier for the backend configuration that served the LAST call,
+        # and the model id it echoed back — None until one runs, and reset to None at the top
+        # of every call so a raised request can never leave a stale one behind. A stale
+        # fingerprint is worse than none: it is a false statement about WHO answered, and the
+        # only thing these values are for is being compared with the next call's. Read them
+        # through ``cogno_synapse.system_fingerprint_of`` / ``served_model_of``; the contract
+        # for reading them safely is there.
+        self.last_system_fingerprint: str | None = None
+        self.last_served_model: str | None = None
         if not self.api_key:
             logger.warning("OPENAI_API_KEY not set — OpenAI calls will fail")
 
@@ -193,6 +224,8 @@ class OpenAIBackend:
             kwargs["response_format"] = {"type": "json_object"}
         log_request(logger, "openai", self.model, system, prompt)
         self.last_cached_tokens = 0
+        self.last_system_fingerprint = None
+        self.last_served_model = None
         try:
             t0 = time.perf_counter()
             resp = await client.chat.completions.create(**kwargs)
@@ -200,6 +233,8 @@ class OpenAIBackend:
             tokens_in = usage.prompt_tokens if usage else 0
             tokens_out = usage.completion_tokens if usage else 0
             self.last_cached_tokens = _cached_prompt_tokens(usage)
+            self.last_system_fingerprint = _provider_string(resp, "system_fingerprint")
+            self.last_served_model = _provider_string(resp, "model")
             log_done(logger, "openai", self.model, t0, tokens_in, tokens_out)
             # A cut response is indistinguishable from a complete one at this layer — same
             # shape, same type, no exception — so it travels on and fails much later, where
@@ -230,6 +265,8 @@ class OpenAIBackend:
     ) -> tuple[dict, int, int]:
         client = self._client()
         self.last_cached_tokens = 0
+        self.last_system_fingerprint = None
+        self.last_served_model = None
         kwargs: dict = {"model": self.model, "messages": messages, **self._token_limit_kwargs()}
         if tools:
             kwargs["tools"] = tools
@@ -270,6 +307,8 @@ class OpenAIBackend:
             tokens_in = usage.prompt_tokens if usage else 0
             tokens_out = usage.completion_tokens if usage else 0
             self.last_cached_tokens = _cached_prompt_tokens(usage)
+            self.last_system_fingerprint = _provider_string(resp, "system_fingerprint")
+            self.last_served_model = _provider_string(resp, "model")
             _warn_if_truncated(resp, self.model)
             result: dict = {"content": msg.content or ""}
             if msg.tool_calls:

@@ -90,3 +90,22 @@ class FallbackBackend:
         Read through ``cogno_synapse.cached_tokens_of``, immediately after the await."""
         active = self._last_successful
         return max(0, int(getattr(active, "last_cached_tokens", 0) or 0)) if active else 0
+
+    @property
+    def last_system_fingerprint(self) -> Optional[str]:
+        """Forwarded from the backend that actually ran, like ``model`` beside it.
+
+        A chain answers for the link that served the call. Reporting the FIRST backend's
+        fingerprint for a call the SECOND one served is not an approximation — it is a false
+        statement about who answered, and the whole point of the field is telling one backend
+        configuration from another. Before anything has run, and whenever the link that did run
+        reports nothing, the answer is ``None``: the chain never fills a gap with a value from a
+        backend that did not serve this call.
+
+        Read through ``cogno_synapse.system_fingerprint_of``, immediately after the await."""
+        return getattr(self._last_successful, "last_system_fingerprint", None)
+
+    @property
+    def last_served_model(self) -> Optional[str]:
+        """The snapshot the serving link's provider echoed back. Same rule as above."""
+        return getattr(self._last_successful, "last_served_model", None)
