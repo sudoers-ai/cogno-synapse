@@ -24,6 +24,7 @@ except PackageNotFoundError:  # source tree without an installed dist (e.g. vend
 
 from cogno_synapse.base import (
     LLMBackend, ToolCallingBackend, Embedder, cached_tokens_of,
+    served_model_of, system_fingerprint_of,
 )
 from cogno_synapse.ollama import OllamaBackend, OllamaEmbedder
 from cogno_synapse.cache import CachingEmbedder, EmbeddingUsage
@@ -46,6 +47,8 @@ __all__ = [
     "ToolCallingBackend",
     "Embedder",
     "cached_tokens_of",
+    "system_fingerprint_of",
+    "served_model_of",
     "OllamaBackend",
     "OllamaEmbedder",
     "CachingEmbedder",

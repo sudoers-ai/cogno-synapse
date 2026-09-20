@@ -1,4 +1,4 @@
-from typing import Protocol, runtime_checkable
+from typing import Optional, Protocol, runtime_checkable
 
 @runtime_checkable
 class LLMBackend(Protocol):
@@ -84,6 +84,86 @@ def cached_tokens_of(backend: object) -> int:
         shape of their counters, and a wrong subset is worse than a missing one.
     """
     return max(0, int(getattr(backend, "last_cached_tokens", 0) or 0))
+
+
+def _last_provider_string(backend: object, attribute: str) -> Optional[str]:
+    """Read a per-call identifier the provider stamped on the LAST response, or ``None``.
+
+    The single normaliser behind ``system_fingerprint_of`` and ``served_model_of``, so both
+    answer "the provider did not say" the same way. Anything that is not a non-blank string —
+    a missing attribute, ``None``, an empty or whitespace-only echo, a number — reads as
+    ``None``: these values are only ever COMPARED to one another, and a blank that compares
+    equal to another blank would assert that two calls were served by the same thing when
+    neither said anything at all.
+    """
+    value = getattr(backend, attribute, None)
+    if not isinstance(value, str):
+        return None
+    return value.strip() or None
+
+
+def system_fingerprint_of(backend: object) -> Optional[str]:
+    """The provider's identifier for the backend configuration that served the LAST call.
+
+    THE single definition, like ``cached_tokens_of`` above — a consumer asks here instead of
+    reaching for the attribute, so "which backends report it, and what does silence mean" is
+    answered in one place.
+
+    **What it is for.** At ``temperature=0`` a hosted provider only *requests* greedy decoding;
+    it does not promise it, and the snapshot behind a model ALIAS can move without the name
+    changing. So a byte-identical prompt can be classified one way at noon and the other way at
+    one, and from outside there is nothing to compare. OpenAI already answers that question on
+    every response and this layer was discarding it: with the fingerprint recorded per call,
+    "did the backend change under us?" is a string comparison rather than a theory.
+
+    **``None`` means the provider did not say** — it is never ``""`` and never a stand-in
+    constant. A backend with no such notion, a provider that omits the field, and a call that
+    has not happened yet all answer ``None``, and ``None`` must stay distinguishable from every
+    real fingerprint: two calls that both answer ``None`` are two calls that told us nothing,
+    NOT two calls served by the same configuration.
+
+    **Read it IMMEDIATELY after the ``await`` that produced the call**, with no other ``await``
+    in between::
+
+        text, tin, tout = await backend.generate(system, prompt)
+        fingerprint = system_fingerprint_of(backend)   # ← no suspension point above this line
+
+    Same property, and the same limits, as ``cached_tokens_of``: a per-INSTANCE last-call
+    attribute is safe on a backend shared between concurrent turns only because a
+    single-threaded event loop cannot run another coroutine between the await resolving and the
+    next statement. It is NOT safe across an ``await``, and not safe if a caller drives the same
+    instance from two OS threads. A per-call return channel would need a change to the
+    ``generate``/``chat_with_tools`` tuples that every stage, stub and downstream backend
+    satisfies; this does not.
+
+    Who reports one:
+
+      * **OpenAI** — ``response.system_fingerprint``, on both the text and the tool-calling
+        path. Reported.
+      * **The OpenAI-COMPATIBLE endpoints** reached through ``OpenAIBackend(base_url=...)``
+        (DeepSeek, Moonshot/Kimi, xAI, OpenRouter, Together, Fireworks) — most omit the field.
+        Read defensively; a missing one is ``None``, never an exception.
+      * **Groq** — OpenAI-shaped response, same field, read the same way. Reported when present.
+      * **Anthropic / Gemini / Bedrock / Ollama** — no equivalent field exists. ``None``. An
+        invented substitute (a model name, a hash of the request) would compare equal across
+        genuinely different backends, which is the one failure this must not have.
+    """
+    return _last_provider_string(backend, "last_system_fingerprint")
+
+
+def served_model_of(backend: object) -> Optional[str]:
+    """The model id the provider ECHOED BACK on the LAST call, or ``None``.
+
+    The other half of the same question. ``backend.model`` is what we ASKED for and may be an
+    alias (``gpt-4o-mini``); this is what answered, and for OpenAI that is the dated snapshot
+    (``gpt-4o-mini-2024-07-18``). An alias moving to a new snapshot and a replica running a
+    different backend configuration are two different drifts, and only these two fields
+    together tell them apart.
+
+    Identical rules to ``system_fingerprint_of``: ``None`` when unknown, read immediately after
+    the ``await``, forwarded by ``FallbackBackend`` from the link that actually ran.
+    """
+    return _last_provider_string(backend, "last_served_model")
 
 
 @runtime_checkable
