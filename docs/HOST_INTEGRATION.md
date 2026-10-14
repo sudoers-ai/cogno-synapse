@@ -87,6 +87,36 @@ chain = FallbackBackend(
 The business model ladder (which models in which order per tenant) is **host**
 policy — synapse just runs the chain you build.
 
+### A schema with the request (`StructuredBackend`)
+
+A third optional protocol, probed like `ToolCallingBackend`. A backend that has
+BOTH `schema_dialect(form)` and `generate_structured(system, prompt, *, schema,
+name, form)` can send a JSON Schema with the request; `generate` is unchanged for
+everyone.
+
+| What | Rule |
+| --- | --- |
+| Probe | `schema_dialect_of(backend, form)` — the protocol AND a non-`None` answer from the closed `SCHEMA_ANNOUNCEMENTS`. Never raises. |
+| Form | `"open"` or `"strict"` (`SCHEMA_FORMS`), per CALL, no default. |
+| Schema | The canonical one. The leaf converts (`to_dialect`); a chain passes it on untouched. |
+| Receipt | `schema_applied_of(backend)` right after the `await`: a dialect, `"refused"`, or `None`. |
+| A 400 on the schema | One repeat on the same backend without it; receipt `"refused"`; remembered per `(model, schema digest)` for 15 minutes. Not seen by the failover loop. |
+| 429 / timeout / 5xx | Propagate as from `generate`. |
+
+**If you write a wrapper around a backend**, it is a sink: either define both
+members on the CLASS and forward the schema to the backend that serves the call
+(reading its receipt on the line after the `await` and exposing it as
+`last_schema_dialect`), or define neither and stay a plain `LLMBackend`. Do not
+forward through `__getattr__`: from Python 3.12 a `runtime_checkable` protocol
+resolves members with `inspect.getattr_static`, which never calls it, so the
+wrapper leaves the probe and the schema is dropped without a word.
+`FallbackBackend` is the worked example; the per-backend table is in the README.
+
+A chain answers `"chain"` when ANY link answers the form — not all, unlike the
+native-tools announcement. The tool announcement picks the prompt, so one link
+that cannot keep it breaks the turn; a schema travels outside the prompt, so a
+link without a dialect serves the same call through `generate`.
+
 ## 5. Error contract
 
 Backends **raise** on transport/auth failure rather than returning `("", 0, 0)`:

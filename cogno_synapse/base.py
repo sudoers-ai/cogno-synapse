@@ -1,4 +1,6 @@
-from typing import Optional, Protocol, runtime_checkable
+from typing import Any, Mapping, Optional, Protocol, runtime_checkable
+
+from cogno_synapse.schema import SCHEMA_ANNOUNCEMENTS, SCHEMA_RECEIPTS
 
 @runtime_checkable
 class LLMBackend(Protocol):
@@ -49,6 +51,108 @@ class ToolCallingBackend(LLMBackend, Protocol):
     def supports_native_tools(self) -> bool:
         """True if native FC is available right now (the EGO uses it then)."""
         ...
+
+
+@runtime_checkable
+class StructuredBackend(LLMBackend, Protocol):
+    """Optional extension: a backend that can carry a JSON Schema WITH the request.
+
+    A NEW pair of members, not a new argument on ``generate``. ``generate(system, prompt)`` keeps
+    the two-argument shape every backend, wrapper and test double already satisfies, so nothing
+    that exists can meet a keyword it did not expect; and a plain ``LLMBackend`` does not satisfy
+    this protocol, because the protocol has members of its own.
+
+    **The probe is a pair**, the one the tool path already uses::
+
+        isinstance(backend, StructuredBackend) and backend.schema_dialect(form)
+
+    — through :func:`schema_dialect_of`, the single definition. Both members live on the CLASS
+    (Python 3.12 resolves protocol members with ``inspect.getattr_static``; ``__getattr__`` does
+    not count), and the one that says "no" is the METHOD, not its absence: a backend that has
+    ``schema_dialect`` and answers ``None`` is a backend that, right now, for that form, takes no
+    schema.
+
+    **The form travels with the CALL** — ``"open"`` or ``"strict"``
+    (``cogno_synapse.SCHEMA_FORMS``), with no default on either member: one instance serves
+    several stages at once, each free to ask for a different form, so the form cannot live on the
+    instance, and a caller that forgets it must fail rather than get one picked for it.
+
+    **The schema travels with the call too, and is the CANONICAL one.** The leaf converts it to
+    its own dialect (``cogno_synapse.schema.to_dialect``); a chain passes it on untouched.
+
+    **Asking for a schema never changes a byte of ``system`` or ``prompt``.** The schema rides
+    outside the prompt, which is why a link with no dialect can serve the same call through plain
+    ``generate``.
+
+    **A schema the provider refuses does not cost the turn.** Inside ``generate_structured`` a 400
+    is answered by ONE repeat on the SAME backend without the schema; the receipt reads
+    ``"refused"``; the instance remembers ``(model, schema digest)`` for fifteen minutes and does
+    not send that schema again. Nothing reaches the failover loop, so no retry is spent and no
+    breaker opens. A 429, a timeout or a 5xx is NOT swallowed: it propagates as it always did.
+    """
+
+    def schema_dialect(self, form: str) -> Optional[str]:
+        """The dialect this backend would carry a ``form`` schema in RIGHT NOW, or ``None``.
+
+        One of ``cogno_synapse.SCHEMA_DIALECTS`` for a leaf, ``"chain"`` for a chain with at least
+        one link that answers this form. Never a demotion: a backend with no strict dialect
+        answers ``None`` to ``"strict"``, it does not answer its open one.
+        """
+        ...
+
+    async def generate_structured(
+        self, system: str, prompt: str, *, schema: Mapping[str, Any], name: str, form: str,
+    ) -> tuple[str, int, int]:
+        """``generate``, with ``schema`` (canonical) sent in the dialect of ``form``.
+
+        Same return tuple as ``generate``. What actually travelled is the RECEIPT, read through
+        :func:`schema_applied_of` immediately after the ``await``.
+        """
+        ...
+
+
+def schema_dialect_of(backend: object, form: object) -> Optional[str]:
+    """What ``backend`` announces for a ``form`` schema — THE probe, in one place.
+
+    ``None`` unless the backend satisfies :class:`StructuredBackend` AND its ``schema_dialect``
+    answers a value of the closed ``cogno_synapse.SCHEMA_ANNOUNCEMENTS``. Anything else — a plain
+    backend, a wrapper that forwards attributes through ``__getattr__``, a test double, an answer
+    outside the alphabet, a ``schema_dialect`` that raises — reads as ``None``, and the caller
+    uses ``generate`` as it always did. A probe must never be the reason a call dies.
+    """
+    if not isinstance(backend, StructuredBackend):
+        return None
+    try:
+        announced = backend.schema_dialect(form)  # type: ignore[arg-type]
+    except Exception:  # noqa: BLE001 — a probe never raises
+        return None
+    return announced if isinstance(announced, str) and announced in SCHEMA_ANNOUNCEMENTS else None
+
+
+def schema_applied_of(backend: object) -> Optional[str]:
+    """The RECEIPT of the LAST call: what happened to the schema that was asked for.
+
+    THE single definition, like ``cached_tokens_of`` below. Closed alphabet
+    (``cogno_synapse.SCHEMA_RECEIPTS``):
+
+      * a DIALECT — the schema WAS in the request, in that shape;
+      * ``"refused"`` — one was asked for and did not travel: the provider refused it and the call
+        was repeated without, or the instance remembered such a refusal, or the schema could not
+        be converted to the dialect;
+      * ``None`` — the call carried no schema: it was a plain ``generate``, or the backend that
+        served it has no dialect for the form.
+
+    It is the receipt, not the announcement, that a trace records: a chain announces ``"chain"``
+    and is then served by whichever link answers, with or without a dialect.
+
+    **Read it IMMEDIATELY after the ``await`` that produced the call**, with no other ``await``
+    in between — the same property and the same limits as ``cached_tokens_of``: a per-INSTANCE
+    last-call value is safe on a backend shared between concurrent calls only because a
+    single-threaded event loop cannot run another coroutine between the await resolving and the
+    next statement. It is NOT safe across an ``await``, and not safe from two OS threads.
+    """
+    value = getattr(backend, "last_schema_dialect", None)
+    return value if isinstance(value, str) and value in SCHEMA_RECEIPTS else None
 
 
 def cached_tokens_of(backend: object) -> int:

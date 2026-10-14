@@ -14,11 +14,12 @@ catch and fail over).
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from cogno_homeo import CircuitBreaker, MetricsSink, RetryPolicy, resilient_call
 
-from cogno_synapse.base import LLMBackend
+from cogno_synapse.base import LLMBackend, schema_applied_of, schema_dialect_of
+from cogno_synapse.schema import CHAIN_DIALECT
 
 
 def _supports(backend: object) -> bool:
@@ -43,11 +44,63 @@ class FallbackBackend:
         self._policy = policy
         self._metrics = metrics
         self._last_successful: LLMBackend | None = None
+        # The RECEIPT of the last call's schema, as the link that SERVED it left it — captured
+        # inside the attempt, on the line after the link's own await, and stored here. Not a
+        # property forwarded later from ``_last_successful``: a link is shared too, and by the
+        # time a later read reached it another call could have overwritten its value.
+        self.last_schema_dialect: Optional[str] = None
 
     async def generate(self, system: str, prompt: str) -> tuple[str, int, int]:
+        self.last_schema_dialect = None
+
         async def attempt(b: LLMBackend) -> tuple[str, int, int]:
             result = await b.generate(system, prompt)
             self._last_successful = b
+            self.last_schema_dialect = None
+            return result
+
+        return await resilient_call(
+            self.backends, attempt,
+            breaker=self._breaker, policy=self._policy, metrics=self._metrics,
+        )
+
+    def schema_dialect(self, form: str) -> Optional[str]:
+        """``"chain"`` when AT LEAST ONE link answers this ``form``; ``None`` when none does.
+
+        ANY, not ALL — the opposite of what a chain may promise about native tools, and for a
+        reason: the tool announcement picks the PROMPT (native or tagged), so one link that cannot
+        keep it breaks the turn. A schema travels OUTSIDE the prompt: the prompt is the same on
+        both paths, and a link with no dialect serves the very same call through ``generate``.
+        """
+        return CHAIN_DIALECT if any(schema_dialect_of(b, form) for b in self.backends) else None
+
+    async def generate_structured(
+        self, system: str, prompt: str, *, schema: Mapping[str, Any], name: str, form: str,
+    ) -> tuple[str, int, int]:
+        """``generate`` over the chain, each link carrying the schema if IT can.
+
+        Decided PER LINK, inside the attempt: a link that answers ``form`` gets
+        ``generate_structured`` with the schema EXACTLY as it arrived here; a link that does not
+        gets today's two-argument ``generate``. This chain converts nothing — only the leaf knows
+        its dialect, and a chain inside a chain is just a link that answers ``"chain"``.
+
+        The receipt is the serving link's, read on the line after its await. Failover is
+        untouched: a refused schema is settled INSIDE the leaf (one repeat without it), so no
+        retry is spent and no breaker opens; a 429, a timeout or a 5xx raises out of the link and
+        moves this loop on, exactly as in ``generate``.
+        """
+        self.last_schema_dialect = None
+
+        async def attempt(b: LLMBackend) -> tuple[str, int, int]:
+            if schema_dialect_of(b, form) is None:
+                result = await b.generate(system, prompt)
+                receipt = None
+            else:
+                result = await b.generate_structured(  # type: ignore[attr-defined]
+                    system, prompt, schema=schema, name=name, form=form)
+                receipt = schema_applied_of(b)      # no await between the line above and this
+            self._last_successful = b
+            self.last_schema_dialect = receipt
             return result
 
         return await resilient_call(
@@ -56,6 +109,7 @@ class FallbackBackend:
         )
 
     async def chat_with_tools(self, messages: Any, tools: Any, tool_choice: Any = None) -> Any:
+        self.last_schema_dialect = None          # a tool call carries no schema
         fc_backends = [b for b in self.backends if _supports(b)]
         if not fc_backends:
             raise RuntimeError("FallbackBackend: no backend in the chain supports native tools")

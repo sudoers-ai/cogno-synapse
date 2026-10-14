@@ -12,6 +12,7 @@ The light, stable contract everyone shares is a set of structurally-typed `Proto
 
 - `LLMBackend` — `async generate(system, prompt) -> (text, tokens_in, tokens_out)` + a `model` attr.
 - `ToolCallingBackend` (extends `LLMBackend`) — adds `chat_with_tools(...)` + `supports_native_tools()` for native function calling. **Separate and optional**, so a text-only backend (a stub, a distilled student) satisfies only `LLMBackend`.
+- `StructuredBackend` (extends `LLMBackend`) — adds `schema_dialect(form)` + `generate_structured(system, prompt, *, schema, name, form)` for a JSON Schema sent WITH the request. **Separate and optional** for the same reason; `generate` keeps its two arguments. See [A schema with the request](#a-schema-with-the-request).
 - `Embedder` — `async embed(text) -> list[float]`, `async similarity(a, b) -> float`.
 
 The heavy concrete cloud backends are **optional extras** (lazy-imported SDKs) — depend on the protocol, install only the providers you use:
@@ -67,6 +68,40 @@ chain = FallbackBackend(
 )
 text, tin, tout = await chain.generate(system, prompt)
 ```
+
+## A schema with the request
+
+Some providers take a JSON Schema with the request and constrain the reply to it. A backend that can do that satisfies `StructuredBackend`; one that cannot is called through `generate` exactly as before. Nothing calls this by itself — a caller opts in per call:
+
+```python
+from cogno_synapse import schema_applied_of, schema_dialect_of
+
+if schema_dialect_of(backend, "strict"):                 # the probe: protocol AND an answer for this form
+    text, tin, tout = await backend.generate_structured(
+        system, prompt, schema=reply_schema, name="reply", form="strict")
+    applied = schema_applied_of(backend)                 # the receipt — read on the line after the await
+else:
+    text, tin, tout = await backend.generate(system, prompt)
+```
+
+- **The form travels with the call**: `"open"` or `"strict"` (`SCHEMA_FORMS`), with **no default** on `schema_dialect` or `generate_structured`. One instance serves many callers, so the form cannot live on the instance.
+- **Form → dialect, per backend, and never a demotion** (`cogno_synapse.schema.DIALECT_FOR_FORM`):
+
+  | backend | `form="open"` | `form="strict"` |
+  |---|---|---|
+  | `OpenAIBackend` (no `base_url`) | `openai_json_schema` | `openai_strict` |
+  | `OllamaBackend` | `ollama_format` | `None` |
+  | `AnthropicBackend`, `GeminiBackend`, `GroqBackend`, `BedrockBackend`, any `base_url` endpoint | `None` | `None` |
+  | `FallbackBackend` | `"chain"` if a link answers that form | same |
+
+  A backend with no dialect for the form asked answers `None` and serves the call through `generate`; it is never served by its other dialect.
+- **You hand over one canonical schema.** The leaf converts it with the pure `to_dialect(schema, dialect)`: the open dialects send it as it is; `openai_strict` closes every object, requires every key, and widens a key that was optional to `type | null`. A chain passes the schema on untouched. A keyword outside `cogno_synapse.schema.DIALECT_KEYWORDS` raises `ValueError` before any request — that table is a working hypothesis (the small set a derived reply schema uses), not a measurement of any provider.
+- **The OpenAI parameter is built in one place**: `cogno_synapse.openai_backend.response_format_for(schema, name, dialect)`, pure. A capability probe that wants to send exactly what a structured call sends uses it. Which models refuse which dialect is a table that starts EMPTY (`SCHEMA_DIALECTS_REFUSED_BY_MODEL`): a row needs the measurement that justifies it.
+- **The receipt says what travelled** (`schema_applied_of`, closed `SCHEMA_RECEIPTS`): a dialect, `"refused"`, or `None` (no schema went). Like `cached_tokens_of`, it is a per-instance last-call value: read it immediately after the `await`, in one event loop.
+- **A refused schema does not cost the turn.** A 400 on a structured call is repeated ONCE on the same backend without the schema (receipt `"refused"`, log `event=schema_refused model=… dialect=… schema_sha=…`), and that instance does not send that schema to that model again for 15 minutes. The failover loop never sees it. A 429, a timeout or a 5xx propagates as always.
+- **`system` and `prompt` are the same bytes on both paths.** The schema rides outside the prompt.
+
+`cogno_synapse.schema.BACKEND_SCHEMA_SUPPORT` holds one row per class of this package that implements `generate` — `structured` or `plain: <reason>` — and a test derives the class list by AST, so a new backend without a row fails.
 
 ## Scope
 

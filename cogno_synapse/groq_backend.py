@@ -122,5 +122,14 @@ class GroqBackend:
         finally:
             await _safe_close(client)
 
+    def schema_dialect(self, form: str) -> None:
+        """No schema travels with this provider's ``generate``: ``None`` for every form.
+
+        The method answers; its absence would say nothing. There is deliberately NO
+        ``generate_structured`` beside it, so this class does not satisfy ``StructuredBackend``
+        and a stage calls ``generate`` exactly as it always did.
+        """
+        return None
+
     def supports_native_tools(self) -> bool:
         return True

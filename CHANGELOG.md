@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.1.3 — 2026-10-14
+
+A JSON Schema can travel WITH the request. Inert: nothing in this package, and no
+caller that exists, asks for one — every `generate` call is the request it was.
+
+- `StructuredBackend`, a third optional protocol beside `ToolCallingBackend`:
+  `schema_dialect(form)` + `generate_structured(system, prompt, *, schema, name,
+  form)`. NEW members, not a new argument: `generate(system, prompt)` keeps its
+  two-argument shape on every backend, wrapper and double.
+- The form (`"open"` | `"strict"`, `SCHEMA_FORMS`) travels per CALL and has no
+  default. Form → dialect per backend, never a demotion: OpenAI `open` →
+  `openai_json_schema`, `strict` → `openai_strict`; Ollama `open` →
+  `ollama_format`, `strict` → `None`; Anthropic, Gemini, Groq, Bedrock and every
+  `base_url` endpoint → `None`; a `FallbackBackend` → `"chain"` when any link
+  answers that form.
+- `cogno_synapse.schema.to_dialect(schema, dialect)` — the pure conversion. The
+  caller hands over one canonical schema; the LEAF converts, a chain does not.
+  A keyword outside `DIALECT_KEYWORDS` is a `ValueError` before any request.
+  That table is a working hypothesis, not a measurement of any provider.
+- `cogno_synapse.openai_backend.response_format_for(schema, name, dialect)` builds
+  the OpenAI parameter in one place (pure), and `SCHEMA_DIALECTS_REFUSED_BY_MODEL`
+  — which models refuse which dialect — starts EMPTY: no probe has been run.
+- The receipt: `schema_applied_of(backend)`, read immediately after the `await`
+  like `cached_tokens_of` — a dialect, `"refused"`, or `None`.
+- A 400 on a structured call is ONE repeat on the same backend without the
+  schema (receipt `"refused"`), remembered per `(model, schema digest)` for 15
+  minutes; it never reaches the failover loop, so no retry is spent and no
+  breaker opens. A 429, a timeout or a 5xx propagates as before.
+- `OllamaBackend` sends the schema in the `format` field of THAT call;
+  `self.format` is never written.
+- `BACKEND_SCHEMA_SUPPORT`: one row per class that implements `generate`
+  (`structured` | `plain: <reason>`); a test derives the class list by AST.
+- `OpenAIBackend.generate` and `OllamaBackend.generate` now run through a private
+  helper each (`_complete`, `_post`); the request each sends is unchanged, pinned
+  by literal requests in `tests/unit/test_structured_backend.py`.
+
 ## 0.1.2 — 2026-08-04
 
 The Ollama call timeout stops assuming a GPU.

@@ -23,8 +23,12 @@ except PackageNotFoundError:  # source tree without an installed dist (e.g. vend
 
 
 from cogno_synapse.base import (
-    LLMBackend, ToolCallingBackend, Embedder, cached_tokens_of,
-    served_model_of, system_fingerprint_of,
+    LLMBackend, ToolCallingBackend, StructuredBackend, Embedder, cached_tokens_of,
+    schema_applied_of, schema_dialect_of, served_model_of, system_fingerprint_of,
+)
+from cogno_synapse.schema import (
+    BACKEND_SCHEMA_SUPPORT, CHAIN_DIALECT, SCHEMA_ANNOUNCEMENTS, SCHEMA_DIALECTS, SCHEMA_FORMS,
+    SCHEMA_RECEIPTS, SCHEMA_REFUSED, schema_digest, to_dialect,
 )
 from cogno_synapse.ollama import OllamaBackend, OllamaEmbedder
 from cogno_synapse.cache import CachingEmbedder, EmbeddingUsage
@@ -45,8 +49,20 @@ from cogno_synapse.errors import SynapseError, MissingAPIKeyError, InvalidAPIKey
 __all__ = [
     "LLMBackend",
     "ToolCallingBackend",
+    "StructuredBackend",
     "Embedder",
     "cached_tokens_of",
+    "schema_dialect_of",
+    "schema_applied_of",
+    "SCHEMA_FORMS",
+    "SCHEMA_DIALECTS",
+    "SCHEMA_ANNOUNCEMENTS",
+    "SCHEMA_RECEIPTS",
+    "SCHEMA_REFUSED",
+    "CHAIN_DIALECT",
+    "BACKEND_SCHEMA_SUPPORT",
+    "to_dialect",
+    "schema_digest",
     "system_fingerprint_of",
     "served_model_of",
     "OllamaBackend",
