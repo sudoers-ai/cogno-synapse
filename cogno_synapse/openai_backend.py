@@ -18,12 +18,40 @@ import os
 import time
 import json
 import logging
+from typing import Any, Mapping, Optional
 
 from cogno_synapse.errors import InvalidAPIKeyError
+from cogno_synapse.schema import (SCHEMA_NAME_RE, SCHEMA_REFUSED, SchemaRefusals, dialect_for,
+                                  is_invalid_request, schema_digest, to_dialect)
 from cogno_synapse.tool_parsing import parse_tool_calls_from_text
 from cogno_synapse._obs import log_done, log_request, warn_if_retryable
 
 logger = logging.getLogger("cogno_synapse.openai")
+
+#: Model-name prefix → the schema dialects a capability PROBE showed that model refuses.
+#: EMPTY, and that is a statement: no probe has been run against any model, so nothing is known
+#: to be refused and nothing is assumed to be. ``OpenAIBackend.schema_dialect`` reads it; a row is
+#: added only with the measurement that justifies it. A model that refuses a dialect with no row
+#: here still costs nothing but one failed round trip per fifteen minutes — the 400 degrades to a
+#: call without the schema (see ``generate_structured``).
+SCHEMA_DIALECTS_REFUSED_BY_MODEL: "dict[str, frozenset[str]]" = {}
+
+
+def response_format_for(schema: Mapping[str, Any], name: str, dialect: str) -> dict:
+    """The ``response_format`` a structured call sends: the canonical ``schema`` in ``dialect``.
+
+    PURE, and the ONE place the parameter is built — ``generate_structured`` calls it, and a
+    capability probe that wants to send exactly what production would send calls it too, instead
+    of assembling a second copy. Raises ``ValueError`` (before any request) for a dialect that is
+    not one of OpenAI's two, for a ``name`` outside the provider's rule, and for whatever
+    ``to_dialect`` refuses.
+    """
+    if dialect not in ("openai_json_schema", "openai_strict"):
+        raise ValueError(f"{dialect!r} is not an OpenAI schema dialect")
+    if not isinstance(name, str) or not SCHEMA_NAME_RE.match(name):
+        raise ValueError("schema name is outside the provider's rule")
+    return {"type": "json_schema", "json_schema": {
+        "name": name, "strict": dialect == "openai_strict", "schema": to_dialect(schema, dialect)}}
 
 
 def _warn_if_truncated(resp: object, model: str) -> bool:
@@ -159,6 +187,15 @@ class OpenAIBackend:
         # for reading them safely is there.
         self.last_system_fingerprint: str | None = None
         self.last_served_model: str | None = None
+        # The RECEIPT of the last call's schema — a dialect (it travelled), "refused" (asked for,
+        # did not travel) or None (no schema). Written at the END of every text call (see
+        # ``generate``), so a plain call can never be read with a structured call's receipt.
+        # Read it through ``cogno_synapse.schema_applied_of``, immediately after the await.
+        self.last_schema_dialect: str | None = None
+        # What THIS instance remembers about schemas the provider refused (model + digest, for
+        # fifteen minutes). Per instance, like ``_tools_need_effort_none``: a refused schema
+        # would otherwise cost a failed round trip on every call that carries it.
+        self._schema_refusals = SchemaRefusals()
         if not self.api_key:
             logger.warning("OPENAI_API_KEY not set — OpenAI calls will fail")
 
@@ -199,6 +236,97 @@ class OpenAIBackend:
         return openai.AsyncOpenAI(**kwargs)
 
     async def generate(self, system: str, prompt: str) -> tuple[str, int, int]:
+        result = await self._complete(system, prompt, None)
+        # The receipt is written HERE, after the last suspension point of the call (``_complete``
+        # ends by awaiting the client's close), and nothing awaits between this line and the
+        # caller's next statement. Written any earlier, a structured call finishing on this same
+        # instance in between would leave ITS dialect for this plain call to be read with.
+        self.last_schema_dialect = None
+        return result
+
+    def schema_dialect(self, form: str) -> Optional[str]:
+        """The dialect this backend carries a ``form`` schema in, or ``None``.
+
+        ``open`` → ``openai_json_schema``, ``strict`` → ``openai_strict``. ``None`` through
+        ``base_url`` (the OpenAI-compatible endpoints share ``/chat/completions`` and say nothing
+        about ``response_format``; sending it blind is a 400 on every turn, the same reason
+        ``_supports_json_mode`` excludes them), and for a model a probe showed refuses that
+        dialect (``SCHEMA_DIALECTS_REFUSED_BY_MODEL``).
+        """
+        if self.base_url:
+            return None
+        dialect = dialect_for("openai", form)
+        if dialect is None:
+            return None
+        model = self.model.lower()
+        for prefix, refused in SCHEMA_DIALECTS_REFUSED_BY_MODEL.items():
+            if model.startswith(prefix.lower()) and dialect in refused:
+                return None
+        return dialect
+
+    async def generate_structured(
+        self, system: str, prompt: str, *, schema: Mapping[str, Any], name: str, form: str,
+    ) -> tuple[str, int, int]:
+        """``generate`` with the canonical ``schema`` sent as ``response_format`` in the dialect of
+        ``form``. ``system`` and ``prompt`` reach the provider exactly as ``generate`` sends them.
+
+        The receipt (``cogno_synapse.schema_applied_of``) says what travelled:
+
+        * no dialect for this form → today's ``generate``, receipt ``None``;
+        * the schema cannot be said in the dialect (``ValueError`` from ``to_dialect``, or a
+          ``name`` the provider's rule refuses) → today's ``generate``, receipt ``"refused"``;
+        * the provider answers 400 → ONE repeat here, without the schema, receipt ``"refused"``,
+          and this instance does not send that schema to that model again for fifteen minutes.
+          The failover loop above never sees it: no retry spent, no breaker opened;
+        * anything else that fails — a 429, a timeout, a 5xx, a rejected key — propagates
+          untouched, exactly as it does from ``generate``.
+
+        The model's own refusal (the strict mode may answer with ``refusal`` and no content)
+        comes back as the empty string, which the caller already reads as an unreadable reply.
+        """
+        dialect = self.schema_dialect(form)
+        if dialect is None:
+            return await self.generate(system, prompt)
+        try:
+            response_format = response_format_for(schema, name, dialect)
+        except ValueError as exc:
+            logger.warning("event=schema_unconvertible provider=openai model=%s dialect=%s reason=%s",
+                           self.model, dialect, exc)
+            return await self._without_the_schema(system, prompt)
+        # The digest is of the schema AS IT IS SENT (so the two dialects of one canonical schema
+        # are remembered apart), and it is the only thing of the schema a log line carries.
+        sha = schema_digest(response_format["json_schema"]["schema"])
+        if self._schema_refusals.refused(self.model, sha):
+            return await self._without_the_schema(system, prompt)
+        try:
+            result = await self._complete(system, prompt, response_format)
+        except Exception as exc:
+            if not is_invalid_request(exc):
+                raise
+            # Never the schema and never the provider's error text: the first is long and the
+            # second can quote the request. The digest names the schema; the status is the fact.
+            logger.warning("event=schema_refused provider=openai model=%s dialect=%s schema_sha=%s",
+                           self.model, dialect, sha)
+            result = await self._without_the_schema(system, prompt)
+            # Remembered only once the SAME call went through without it: a 400 that repeats
+            # without the schema was never about the schema, and raises above instead.
+            self._schema_refusals.remember(self.model, sha)
+            return result
+        self.last_schema_dialect = dialect              # after the call's last suspension point
+        return result
+
+    async def _without_the_schema(self, system: str, prompt: str) -> tuple[str, int, int]:
+        """Today's ``generate``, with the receipt of a schema that was asked for and did not go."""
+        result = await self.generate(system, prompt)
+        self.last_schema_dialect = SCHEMA_REFUSED       # no await between the line above and this
+        return result
+
+    async def _complete(
+        self, system: str, prompt: str, response_format: Optional[dict],
+    ) -> tuple[str, int, int]:
+        """One Chat Completions text call. ``response_format=None`` is ``generate``, byte for byte:
+        the JSON-mode rule below decides, as it always did. A dict is a structured call's own
+        ``response_format`` and replaces that rule — nothing else about the request differs."""
         client = self._client()
         kwargs: dict = {
             "model": self.model,
@@ -220,12 +348,15 @@ class OpenAIBackend:
         # O gatilho NÃO é heurística frouxa: a própria OpenAI RECUSA `json_object` se a palavra
         # "json" não aparecer nas mensagens, então a condição que checamos é a mesma que a API
         # impõe. Um prompt que não pede JSON não entra no modo, e nada muda para ele.
-        if _wants_json(system) and self._supports_json_mode():
+        if response_format is not None:
+            kwargs["response_format"] = response_format
+        elif _wants_json(system) and self._supports_json_mode():
             kwargs["response_format"] = {"type": "json_object"}
         log_request(logger, "openai", self.model, system, prompt)
         self.last_cached_tokens = 0
         self.last_system_fingerprint = None
         self.last_served_model = None
+        self.last_schema_dialect = None
         try:
             t0 = time.perf_counter()
             resp = await client.chat.completions.create(**kwargs)
@@ -249,7 +380,13 @@ class OpenAIBackend:
             # degraded turn into a dead one. What it buys is a log line naming the cause, at
             # the only layer that can see it.
             _warn_if_truncated(resp, self.model)
-            return (resp.choices[0].message.content or "", tokens_in, tokens_out)
+            message = resp.choices[0].message
+            if response_format is not None and getattr(message, "refusal", None):
+                # The MODEL declined (a structured reply may carry `refusal` and no content).
+                # Not a new branch: the empty string travels on and is read as an unreadable
+                # reply. This line is what makes it countable — never the refusal's text.
+                logger.warning("event=model_refusal provider=openai model=%s", self.model)
+            return (message.content or "", tokens_in, tokens_out)
         except Exception as exc:
             if _is_auth_error(exc):
                 raise InvalidAPIKeyError(
@@ -267,6 +404,7 @@ class OpenAIBackend:
         self.last_cached_tokens = 0
         self.last_system_fingerprint = None
         self.last_served_model = None
+        self.last_schema_dialect = None          # a tool call carries no schema
         kwargs: dict = {"model": self.model, "messages": messages, **self._token_limit_kwargs()}
         if tools:
             kwargs["tools"] = tools

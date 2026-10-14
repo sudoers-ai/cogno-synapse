@@ -24,6 +24,12 @@ veja `cogno/core/logging.py` no host como referência.
 
 - INFO só no marco "chamada concluída" (`provider`/`model`/`latency_ms`/`tokens`).
 - WARNING em erro recuperável (429/5xx) antes de re-levantar ou cair no fallback.
+- WARNING `event=schema_refused provider=… model=… dialect=… schema_sha=…` quando o
+  provedor recusa (400) um esquema enviado por `generate_structured` e a chamada é
+  repetida sem ele; `event=schema_unconvertible … reason=…` quando o esquema não se
+  consegue dizer no dialecto (a razão nomeia a palavra-chave e o caminho, nunca um
+  valor); `event=model_refusal provider=… model=…` quando o MODELO recusa responder.
+  Nunca o esquema, nunca o texto do erro do provedor, nunca o texto da recusa.
 - O **prompt enviado** e o **JSON bruto de resposta** vão em **DEBUG** (dev-only):
   carregam conteúdo de usuário (PII) e nunca devem ficar on em produção
   multi-tenant. A `api_key` jamais é logada (nem em DEBUG).

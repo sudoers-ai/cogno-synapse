@@ -4,11 +4,13 @@ import asyncio
 import logging
 import os
 import time
-from typing import Optional
+from typing import Any, Mapping, Optional, Union
 
 import httpx
 
 from cogno_synapse.base import LLMBackend, Embedder
+from cogno_synapse.schema import (SCHEMA_REFUSED, SchemaRefusals, dialect_for, is_invalid_request,
+                                  schema_digest, to_dialect)
 from cogno_synapse._math import cosine_similarity
 from cogno_synapse._obs import log_done, log_request, warn_if_retryable
 
@@ -75,16 +77,81 @@ class OllamaBackend(LLMBackend):
         # is the right default; it is a harmless no-op on non-reasoning models.
         self.think = think
         self._endpoint = f"{self.base_url}/api/generate"
+        # The RECEIPT of the last call's schema — a dialect (it travelled), "refused" (asked for,
+        # did not travel) or None (no schema). Written at the END of every call. Read it through
+        # ``cogno_synapse.schema_applied_of``, immediately after the await.
+        self.last_schema_dialect: Optional[str] = None
+        # What THIS instance remembers about schemas the server refused (fifteen minutes).
+        self._schema_refusals = SchemaRefusals()
 
     async def generate(self, system: str, prompt: str) -> tuple[str, int, int]:
+        return await self._post(system, prompt, self.format)
+
+    def schema_dialect(self, form: str) -> Optional[str]:
+        """``ollama_format`` for the ``open`` form; ``None`` for ``strict``.
+
+        Ollama's ``format=<schema>`` already is constrained decoding, and it is the only way this
+        server takes a schema. ``strict`` names another provider's closed form: answering it here
+        too would make two requested forms one identical request.
+        """
+        return dialect_for("ollama", form)
+
+    async def generate_structured(
+        self, system: str, prompt: str, *, schema: Mapping[str, Any], name: str, form: str,
+    ) -> tuple[str, int, int]:
+        """``generate`` with the canonical ``schema`` in THIS CALL's ``format`` field.
+
+        ``self.format`` is never touched: one instance serves several stages and several turns at
+        once, and a schema written onto it would be read by whichever call ran next. ``name`` is
+        not sent (this server has no use for one). Receipt and failure rules are the ones
+        ``StructuredBackend`` states: no dialect → plain ``generate``, receipt ``None``; a schema
+        that cannot be converted, or a 400, → the call goes without it (``self.format`` as it
+        is), receipt ``"refused"``; a 429, a timeout or a 5xx propagates.
+        """
+        dialect = self.schema_dialect(form)
+        if dialect is None:
+            return await self.generate(system, prompt)
+        try:
+            converted = to_dialect(schema, dialect)
+        except ValueError as exc:
+            logger.warning("event=schema_unconvertible provider=ollama model=%s dialect=%s reason=%s",
+                           self.model, dialect, exc)
+            return await self._without_the_schema(system, prompt)
+        sha = schema_digest(converted)
+        if self._schema_refusals.refused(self.model, sha):
+            return await self._without_the_schema(system, prompt)
+        try:
+            result = await self._post(system, prompt, converted)
+        except Exception as exc:
+            if not is_invalid_request(exc):
+                raise
+            logger.warning("event=schema_refused provider=ollama model=%s dialect=%s schema_sha=%s",
+                           self.model, dialect, sha)
+            result = await self._without_the_schema(system, prompt)
+            self._schema_refusals.remember(self.model, sha)
+            return result
+        self.last_schema_dialect = dialect
+        return result
+
+    async def _without_the_schema(self, system: str, prompt: str) -> tuple[str, int, int]:
+        """Today's ``generate``, with the receipt of a schema that was asked for and did not go."""
+        result = await self.generate(system, prompt)
+        self.last_schema_dialect = SCHEMA_REFUSED       # no await between the line above and this
+        return result
+
+    async def _post(
+        self, system: str, prompt: str, fmt: "Union[str, Mapping[str, Any], None]",
+    ) -> tuple[str, int, int]:
+        """One ``/api/generate`` call. ``fmt`` is the ``format`` of THIS request: ``self.format``
+        from ``generate`` (the request it always sent), a schema from ``generate_structured``."""
         payload: dict = {
             "model": self.model,
             "system": system,
             "prompt": prompt,
             "stream": False,
         }
-        if self.format:
-            payload["format"] = self.format
+        if fmt:
+            payload["format"] = fmt
         payload["think"] = self.think
         options: dict = {}
         if self.temperature is not None:
@@ -116,6 +183,11 @@ class OllamaBackend(LLMBackend):
         tokens_out = data.get("eval_count", 0)
 
         log_done(logger, "ollama", self.model, t0, tokens_in, tokens_out)
+        # Written after the call's LAST suspension point (leaving the ``async with`` above awaits
+        # the client's close): nothing awaits between this line and the caller's next statement,
+        # so a structured call finishing on this instance in between cannot leave its receipt
+        # for a plain call to be read with. ``generate_structured`` overwrites it on return.
+        self.last_schema_dialect = None
         return text, tokens_in, tokens_out
 
     async def is_available(self) -> bool:
