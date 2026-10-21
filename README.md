@@ -4,7 +4,7 @@
 
 Named for the *synapse*: the junction that carries the signal between neurons. Where [`cogno-anima`](https://github.com/sudoers-ai/cogno-anima) is the *mind* and [`cogno-engram`](https://github.com/sudoers-ai/cogno-engram) is the *memory*, `cogno-synapse` is the **channel the mind speaks to language/embedding models through**.
 
-> Status: **alpha** — extracted from `cogno-anima`'s `llm/` package; unit suite (mocked SDKs) in place.
+> Status: **alpha** — extracted from `cogno-anima`'s `llm/` package; a unit suite (mocked SDKs and HTTP) plus an integration suite that runs only against a reachable Ollama or real provider keys.
 
 ## Protocol first, implementation optional
 
@@ -18,17 +18,43 @@ The light, stable contract everyone shares is a set of structurally-typed `Proto
 The heavy concrete cloud backends are **optional extras** (lazy-imported SDKs) — depend on the protocol, install only the providers you use:
 
 ```bash
-pip install cogno-synapse                       # protocols + Ollama + OpenAI-compatible HTTP + fallback (httpx only)
-pip install "cogno-synapse[openai]"             # + OpenAI SDK
+pip install cogno-synapse                       # protocols, Ollama, GeminiEmbedder (REST), fallback, key probe (httpx + cogno-homeo)
+pip install "cogno-synapse[openai]"             # + OpenAI SDK — also needed by the OpenAI-compatible providers
 pip install "cogno-synapse[anthropic|groq|gemini|bedrock]"
 pip install "cogno-synapse[llm]"                # all cloud SDKs
 ```
 
+The base install depends on `httpx` and `cogno-homeo` (`pyproject.toml`). The OpenAI-compatible providers are served by `OpenAIBackend`, which builds its client from the `openai` SDK, so they need the `openai` extra too. `GeminiEmbedder` calls the REST API over `httpx` and needs no extra; `GeminiBackend` needs `google-genai`.
+
 ## Backends
 
-`OllamaBackend`/`OllamaEmbedder` (local, `think=false` by default so reasoning models still return direct JSON), plus `OpenAIBackend`, `AnthropicBackend`, `GroqBackend`, `GeminiBackend`, `BedrockBackend` — each implements `LLMBackend` + `ToolCallingBackend`. OpenAI-compatible providers (DeepSeek, Moonshot, xAI/Grok, OpenRouter, Together, Fireworks) reuse `OpenAIBackend` via `base_url`; `create_backend("provider:model")` instantiates one by string. Backends **raise** on transport/auth failure (`InvalidAPIKeyError` for 401/403) rather than degrading silently.
+`OpenAIBackend`, `AnthropicBackend`, `GroqBackend`, `GeminiBackend` and `BedrockBackend` each implement `LLMBackend` + `ToolCallingBackend` (native function calling). `OllamaBackend` (local, `/api/generate`, `think=false` by default so reasoning models still return direct JSON) implements `LLMBackend` and `StructuredBackend` but **not** `ToolCallingBackend` — it has no `chat_with_tools`, so a caller uses the text-fallback path with it. OpenAI-compatible providers (DeepSeek, Moonshot/Kimi, xAI/Grok, OpenRouter, Together, Fireworks) reuse `OpenAIBackend` via `base_url`; `create_backend("provider:model")` instantiates one by string (`cogno_synapse/factory.py`, `_OPENAI_COMPATIBLE`). Backends **raise** on transport/auth failure (`InvalidAPIKeyError` for 401/403) rather than degrading silently.
 
-`CachingEmbedder` wraps any `Embedder` with a bounded LRU + token accounting (`EmbeddingUsage`). `parse_tool_calls_from_text` reads `<TOOL_CALL>` tags for the text-fallback function-calling path (and rescues FC leaks).
+`parse_tool_calls_from_text` reads `<TOOL_CALL>` tags for the text-fallback function-calling path (and rescues FC leaks). Its bracket form (`[tool]`, `[tool(args)]`) counts only when the tag is the only content on its line, so a bracket echoed inside prose — a tool result quoted back — never becomes a call.
+
+Three things `OpenAIBackend` does that a caller would otherwise not see (`cogno_synapse/openai_backend.py`):
+
+- **JSON mode follows the system prompt.** When the `system` text contains "json", `generate` sends `response_format={"type": "json_object"}`. Only the system prompt is read — never `prompt`, which can quote the contact. It is skipped on any `base_url` endpoint and on the reasoning series (`o1`/`o3`/`o4`/`gpt-5`).
+- **`reasoning_effort` defaults to sending nothing.** Set it per instance or deployment-wide with `$OPENAI_REASONING_EFFORT`; it is only sent to the reasoning series. When the provider refuses function tools while reasoning is on (a 400 naming both), `chat_with_tools` repeats the call once with `reasoning_effort="none"` — the remedy the error itself names — and the instance sends `"none"` with tools from then on.
+- **A cut reply is logged.** A `finish_reason` of `length` or `content_filter` logs `event=truncated_response`; the text still travels on.
+
+### Embedders
+
+`OllamaEmbedder` (local, `/api/embed`, falling back to the legacy `/api/embeddings` once per instance on a 404/405 — that endpoint reports no token count), `OpenAIEmbedder`, `GeminiEmbedder` (REST, the key in the `x-goog-api-key` header) and `BedrockEmbedder` (Titan and Cohere) implement `Embedder`. `create_embedder("provider:model", dimensions=…)` builds ONE of them, never a chain — failing over mid-write would mix embedding spaces in one column. The set is closed (ollama, openai, gemini, bedrock): any other cloud prefix raises `NotImplementedError` at construction. `OpenAIEmbedder` raises `EmbeddingResponseError` when the response cannot be mapped back to its inputs, instead of returning empty vectors.
+
+`CachingEmbedder` wraps any `Embedder` with a bounded LRU (keyed by stripped, lower-cased text; `cache_size=0` disables it) + token accounting (`EmbeddingUsage`), and proxies the batch path.
+
+## What the last call reports besides its text
+
+Three per-instance, last-call readers, each read **immediately after the `await`** that produced the call (`cogno_synapse/base.py`):
+
+| reader | what it answers | who reports it |
+|---|---|---|
+| `cached_tokens_of(backend)` | the part of `tokens_in` the provider served from its own prompt cache; 0 = unknown or none | OpenAI and the `base_url` endpoints that send the field |
+| `system_fingerprint_of(backend)` | the provider's id for the configuration that served the call; `None` = not said | OpenAI, Groq |
+| `served_model_of(backend)` | the model id the provider echoed back (the dated snapshot behind an alias); `None` = not said | OpenAI, Groq |
+
+`FallbackBackend` forwards all three from the link that actually served the call. Anthropic's cache counters are not reported: its `input_tokens` excludes the cached part, so the number would not be a subset.
 
 ## BYOK — is this key live?
 
@@ -98,7 +124,7 @@ else:
 - **You hand over one canonical schema.** The leaf converts it with the pure `to_dialect(schema, dialect)`: the open dialects send it as it is; `openai_strict` closes every object, requires every key, and widens a key that was optional to `type | null`. A chain passes the schema on untouched. A keyword outside `cogno_synapse.schema.DIALECT_KEYWORDS` raises `ValueError` before any request — that table is a working hypothesis (the small set a derived reply schema uses), not a measurement of any provider.
 - **The OpenAI parameter is built in one place**: `cogno_synapse.openai_backend.response_format_for(schema, name, dialect)`, pure. A capability probe that wants to send exactly what a structured call sends uses it. Which models refuse which dialect is a table that starts EMPTY (`SCHEMA_DIALECTS_REFUSED_BY_MODEL`): a row needs the measurement that justifies it.
 - **The receipt says what travelled** (`schema_applied_of`, closed `SCHEMA_RECEIPTS`): a dialect, `"refused"`, or `None` (no schema went). Like `cached_tokens_of`, it is a per-instance last-call value: read it immediately after the `await`, in one event loop.
-- **A refused schema does not cost the turn.** A 400 on a structured call is repeated ONCE on the same backend without the schema (receipt `"refused"`, log `event=schema_refused model=… dialect=… schema_sha=…`), and that instance does not send that schema to that model again for 15 minutes. The failover loop never sees it. A 429, a timeout or a 5xx propagates as always.
+- **A refused schema does not cost the turn.** A 400 on a structured call is repeated ONCE on the same backend without the schema (receipt `"refused"`, log `event=schema_refused provider=… model=… dialect=… schema_sha=…`), and that instance does not send that schema to that model again for 15 minutes. The failover loop never sees it. A 429, a timeout or a 5xx propagates as always.
 - **`system` and `prompt` are the same bytes on both paths.** The schema rides outside the prompt.
 
 `cogno_synapse.schema.BACKEND_SCHEMA_SUPPORT` holds one row per class of this package that implements `generate` — `structured` or `plain: <reason>` — and a test derives the class list by AST, so a new backend without a row fails.
@@ -122,9 +148,39 @@ private product layer, but it holds no special powers: everything it does rides
 on the public seams documented in each library's `docs/HOST_INTEGRATION.md`, so
 you can assemble a body of your own.
 
+## Environment
+
+The library reads these variables (`os.environ`/`os.getenv` under `cogno_synapse/`). An explicit constructor argument always wins over the variable.
+
+| variable | read by | notes |
+|---|---|---|
+| `OPENAI_API_KEY` | `OpenAIBackend`, `OpenAIEmbedder`, the factories | |
+| `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, `GEMINI_API_KEY` | the matching backend (and `GeminiEmbedder`), the factories | |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | `BedrockBackend`, `BedrockEmbedder`; the factories check the first | `BedrockBackend` takes no key argument |
+| `AWS_DEFAULT_REGION`, `AWS_REGION` | `BedrockBackend` (the first, then the second; no default) · `BedrockEmbedder` (`AWS_REGION`, default `us-east-1`) | |
+| `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY`, `TOGETHER_API_KEY`, `FIREWORKS_API_KEY` | `create_backend` for the OpenAI-compatible prefixes | |
+| `OPENAI_REASONING_EFFORT` | `OpenAIBackend` | unset = the field is not sent |
+| `COGNO_OLLAMA_TIMEOUT` | `OllamaBackend`, `OllamaEmbedder` | seconds, default 120; read per construction and only when no `timeout=` is passed — `create_backend` passes 600 and `create_embedder` 120, so through the factories it does not apply; a bad value logs `event=bad_timeout_env` and falls back to 120 |
+
+A cloud key that is empty, `dummy`, or contains `sk-proj-*` counts as missing for the factories, which then raise `MissingAPIKeyError` unless `api_key=` is passed. A backend constructed directly without its key does not raise: it logs a WARNING at construction, and the failure arrives on the first call.
+
+The tests read three more: `OLLAMA_BASE_URL` (default `http://localhost:11434`), `COGNO_TEST_OLLAMA_MODEL` (default `qwen3:8b`) and `COGNO_TEST_OLLAMA_EMBED_MODEL` (default `nomic-embed-text`), all in `tests/integration/test_ollama_live.py`; the cloud integration tests skip unless the provider's key (and SDK) is present.
+
 ## Test
 
 ```bash
-pip install -e ".[dev]"      # unit tests mock every SDK — no cloud keys needed
+pip install -e ".[dev]"      # unit tests mock every SDK client and HTTP call — no cloud keys needed
 pytest tests/unit -q
 ```
+
+CI (`.github/workflows/ci.yml`) installs `.[dev,llm]` and runs `ruff check cogno_synapse tests examples`, `mypy cogno_synapse` and `pytest tests -q`. That last one collects the integration suite too: it runs against a reachable Ollama and real provider keys, and skips without them.
+
+## Documentation
+
+| file | what it is |
+|---|---|
+| [`README.md`](README.md) | this page |
+| [`docs/HOST_INTEGRATION.md`](docs/HOST_INTEGRATION.md) | wiring the library into a host: the boundary, the factory, failover, schemas, errors, tokens |
+| [`LOGGING.md`](LOGGING.md) | every log line the library emits, and the convention behind them |
+| [`CHANGELOG.md`](CHANGELOG.md) | release notes |
+| [`examples/host_min.py`](examples/host_min.py) | the smallest runnable host (needs a local Ollama) |

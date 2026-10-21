@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+Documentation only — no code, test or packaging change.
+
+- `README.md`: the install line no longer says "httpx only" (the base install also needs
+  `cogno-homeo`, and the OpenAI-compatible providers need the `openai` extra); `OllamaBackend`
+  is said to be a plain `LLMBackend` (no `chat_with_tools`); new sections for the embedders and
+  `create_embedder`, the three last-call readers (`cached_tokens_of`, `system_fingerprint_of`,
+  `served_model_of`), what `OpenAIBackend` does with JSON mode, `reasoning_effort` and a cut
+  reply, every environment variable the library reads, the CI commands, and an index of every
+  document.
+- `LOGGING.md`: rewritten in English from the log calls themselves — every line, its logger,
+  level and fields. It used to say INFO is only the "call finished" line (the tool-call parser
+  logs three more), that the raw response goes to DEBUG (no line logs it), that loggers are
+  named by `__name__` (one module does), and it pointed at a file of another codebase.
+- `docs/HOST_INTEGRATION.md`: the `kimi` and `grok` prefix aliases, `api_key=` and the
+  placeholder rule, which timeout the factories pass (so `$COGNO_OLLAMA_TIMEOUT` does not reach
+  them), the cloud embedders, `EmbeddingResponseError`, and the last-call readers.
+- This file: the 0.1.3 entry below now lists what landed between 0.1.2 and the 0.1.3 bump.
+
 ## 0.1.3 — 2026-10-14
 
 A JSON Schema can travel WITH the request. Inert: nothing in this package, and no
@@ -35,6 +55,37 @@ caller that exists, asks for one — every `generate` call is the request it was
 - `OpenAIBackend.generate` and `OllamaBackend.generate` now run through a private
   helper each (`_complete`, `_post`); the request each sends is unchanged, pinned
   by literal requests in `tests/unit/test_structured_backend.py`.
+
+Also in this version — landed between 0.1.2 and the 0.1.3 bump, and not listed when the
+entry above was written:
+
+- **BYOK key probe** (#21, #25, #26): `probe_api_key(provider, api_key)` and the
+  `API_KEY_PROBES` table — a cost-free authenticated GET per provider. Fail-open: only a 401
+  or a 403 reads invalid; anything else logs `event=byok_probe_inconclusive` (or
+  `byok_probe_error`) and reads valid. A blank key is never trusted.
+- **Cached prompt tokens** (#22): `cached_tokens_of(backend)`, the part of `tokens_in` OpenAI
+  served from its own cache (`usage.prompt_tokens_details.cached_tokens`), forwarded by
+  `FallbackBackend` from the link that ran. 0 means unknown or none.
+- **Who served the call** (#28): `system_fingerprint_of(backend)` and `served_model_of(backend)`,
+  reported by OpenAI and Groq on both the text and the tool path, `None` when the provider
+  says nothing, forwarded by `FallbackBackend`.
+- **OpenAI JSON mode** (#17, #18): `response_format={"type": "json_object"}` when the SYSTEM
+  prompt contains "json" — never read from `prompt`, which can quote the contact — and never on
+  a `base_url` endpoint or the reasoning series.
+- **Reasoning models and tools** (#19): `reasoning_effort` (argument or
+  `$OPENAI_REASONING_EFFORT`), sent only to the reasoning series and, by default, not at all.
+  A tool call refused because reasoning is on is repeated once with `reasoning_effort="none"`,
+  remembered per instance (`event=reasoning_tools_conflict`).
+- **A cut reply is logged** (#15): `event=truncated_response` when `finish_reason` is `length`
+  or `content_filter`.
+- **Ollama embeddings are metered** (#23): `OllamaEmbedder` posts to `/api/embed`, which
+  reports `prompt_eval_count`; on a 404/405 it falls back once per instance to the legacy
+  `/api/embeddings` (no count) and logs `event=embed_endpoint_missing`.
+- **Security**: the bracket form of the tool-call rescue fires only when the tag is alone on
+  its line, so a bracket echoed in prose is never executed; `GeminiEmbedder` sends its key in
+  the `x-goog-api-key` header instead of the URL.
+- **CI** (#20, #27): one test step over `tests/`, pinned by
+  `tests/unit/test_ci_runs_every_test_file.py`; a concurrency group per workflow and ref.
 
 ## 0.1.2 — 2026-08-04
 
