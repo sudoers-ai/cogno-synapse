@@ -42,12 +42,21 @@ gen = create_backend("deepseek:deepseek-chat")       # OpenAI-compatible via bas
 
 `create_backend("provider:model")` raises `MissingAPIKeyError` for a cloud
 provider without a usable key (fail loudly, never silently degrade to a local
-model the caller did not ask for). Supported prefixes: `openai`, `anthropic`,
-`groq`, `gemini`, `bedrock`, the OpenAI-compatible set (`deepseek`, `moonshot`,
-`xai`, `openrouter`, `together`, `fireworks`), and `ollama` (also the
-bare/unknown fallback). There is deliberately **no `mistral:` prefix** — it would
+model the caller did not ask for). `api_key=` overrides the environment variable
+(a per-tenant key, BYOK); a variable that is empty, `dummy`, or contains
+`sk-proj-*` counts as missing. Supported prefixes: `openai`, `anthropic`,
+`groq`, `gemini`, `bedrock`, the OpenAI-compatible set (`deepseek`, `moonshot`
+and its alias `kimi`, `xai` and its alias `grok`, `openrouter`, `together`,
+`fireworks`), and `ollama` (also the bare/unknown fallback; an empty string
+builds Ollama `llama3.2`). There is deliberately **no `mistral:` prefix** — it would
 clobber Ollama's `mistral:latest`; `create_backend("mistral:latest")` resolves to
-Ollama.
+Ollama. `OllamaBackend` itself is a plain `LLMBackend` (it has no
+`chat_with_tools`), which is why it takes the text-fallback path below.
+
+**Timeouts.** `create_backend` passes `timeout=600` and `create_embedder`
+`timeout=120` unless told otherwise. `$COGNO_OLLAMA_TIMEOUT` (default 120 s) is
+read only by an `OllamaBackend`/`OllamaEmbedder` built WITHOUT a `timeout=`, so
+it does not reach one built through the factories.
 
 Install only the SDKs you use:
 
@@ -66,6 +75,13 @@ embedder = CachingEmbedder(OllamaEmbedder(model="nomic-embed-text:latest"))
 `CachingEmbedder` wraps **any** `Embedder` with a bounded LRU (by lowercased text)
 plus token/call accounting (`embedder.usage -> EmbeddingUsage`). Used by NOUMENO
 (subject continuity) and ID (goal similarity) in `cogno-anima`.
+
+The cloud embedders (`OpenAIEmbedder`, `GeminiEmbedder`, `BedrockEmbedder`) are
+built by `create_embedder("provider:model", dimensions=…)`, the same grammar as
+`create_backend`. It returns ONE embedder, never a chain — failing over mid-write
+mixes embedding spaces in one column — and refuses any provider outside ollama,
+openai, gemini and bedrock with `NotImplementedError` at construction.
+`dimensions` is the width your vector store was built for; Ollama ignores it.
 
 ## 4. Resilient failover
 
@@ -124,9 +140,24 @@ Backends **raise** on transport/auth failure rather than returning `("", 0, 0)`:
 subclasses. Auth errors are config problems retry/fallback can't fix, so they're
 typed apart from transient failures — surface them distinctly.
 
+`MissingAPIKeyError` comes from the two factories; a backend constructed directly
+without its key only logs a WARNING. The third subclass, `EmbeddingResponseError`,
+is raised by `OpenAIEmbedder` when the provider answered but the response cannot
+be mapped back to the inputs — returning empty vectors instead would write silent
+corruption into a store.
+
 ## 6. Tokens
 
 `generate` returns `(text, tokens_in, tokens_out)` and `EmbeddingUsage` tracks
 embedding tokens — synapse **produces** the counts. Aggregation per turn happens
 in `cogno-anima` (`StageMetrics`/`PipelineContext`); **pricing/billing is the
 host's**.
+
+Three more facts about the LAST call are read per instance, each **immediately
+after the `await`** that produced it, with no other `await` in between:
+`cached_tokens_of(backend)` (the subset of `tokens_in` the provider served from its
+own cache — OpenAI and the `base_url` endpoints that send it; 0 = unknown),
+`system_fingerprint_of(backend)` and `served_model_of(backend)` (who served the
+call — OpenAI and Groq; `None` = not said). A `FallbackBackend` forwards them from
+the link that served the call. Price `cached_tokens` apart from the fresh input;
+compare the other two between calls, never sum them.
