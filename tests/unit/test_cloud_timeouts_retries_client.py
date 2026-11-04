@@ -39,6 +39,10 @@ class FakeServer:
         self.connections = 0
         self.requests = 0
         self._server: "asyncio.base_events.Server | None" = None
+        # Python 3.12's `Server.wait_closed()` waits for every open connection to close
+        # (3.10/3.11 returned at once), so a ``hang`` handler left sleeping held the test's
+        # teardown forever. Exiting releases the hang, and the handler closes its connection.
+        self._release = asyncio.Event()
 
     async def __aenter__(self) -> "FakeServer":
         self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
@@ -47,6 +51,7 @@ class FakeServer:
 
     async def __aexit__(self, *exc) -> None:
         assert self._server is not None
+        self._release.set()
         self._server.close()
         await self._server.wait_closed()
 
@@ -67,7 +72,8 @@ class FakeServer:
                     await reader.readexactly(length)
                 self.requests += 1
                 if self.mode == "hang":
-                    await asyncio.sleep(3600)
+                    await self._release.wait()          # until the server exits — never answers
+                    return
                 if self.mode == "fail":
                     body, status = b'{"error": {"message": "boom"}}', b"500 Internal Server Error"
                 else:
