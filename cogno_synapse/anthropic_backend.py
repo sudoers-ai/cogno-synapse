@@ -16,7 +16,9 @@ import json
 import time
 import logging
 
+from cogno_synapse._client_cache import LoopBoundClient
 from cogno_synapse.errors import InvalidAPIKeyError
+from cogno_synapse.timeouts import SDK_MAX_RETRIES, cloud_timeout
 from cogno_synapse.tool_parsing import parse_tool_calls_from_text
 from cogno_synapse._obs import log_done, log_request, warn_if_retryable
 
@@ -39,24 +41,37 @@ class AnthropicBackend:
         api_key: str | None = None,
         temperature: float | None = None,
         max_tokens: int = 4096,
-        timeout: int = 120,
+        timeout: float | None = None,
     ) -> None:
         self.model = model
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY", "")
         self.temperature = temperature
         self.max_tokens = max_tokens
-        self.timeout = timeout
+        # 30 s unless told otherwise (``cogno_synapse.timeouts``: why, and how to steer it).
+        self.timeout = timeout if timeout is not None else cloud_timeout()
+        # ONE SDK client per instance (and per event loop), reused by every call
+        # (``cogno_synapse._client_cache``).
+        self._clients = LoopBoundClient(self._new_client)
         if not self.api_key:
             logger.warning("ANTHROPIC_API_KEY not set — Anthropic calls will fail")
 
     def _client(self):
+        """This instance's SDK client — built once, reused (``LoopBoundClient``)."""
+        return self._clients.get()
+
+    async def aclose(self) -> None:
+        """Close the cached SDK client (a host calls it at shutdown)."""
+        await self._clients.aclose()
+
+    def _new_client(self):
         try:
             import anthropic
         except ImportError as exc:
             raise ImportError(
                 'anthropic not installed. Run: pip install "cogno-anima[anthropic]"'
             ) from exc
-        return anthropic.AsyncAnthropic(api_key=self.api_key, timeout=self.timeout)
+        return anthropic.AsyncAnthropic(api_key=self.api_key, timeout=self.timeout,
+                                        max_retries=SDK_MAX_RETRIES)  # the ONE retry layer is the host's
 
     async def generate(self, system: str, prompt: str) -> tuple[str, int, int]:
         client = self._client()
@@ -87,8 +102,6 @@ class AnthropicBackend:
                 ) from exc
             warn_if_retryable(logger, "anthropic", self.model, exc)
             raise
-        finally:
-            await _safe_close(client)
 
     async def chat_with_tools(self, messages, tools, tool_choice=None):
         client = self._client()
@@ -137,8 +150,6 @@ class AnthropicBackend:
                     f"ANTHROPIC_API_KEY invalid/rejected (model={self.model}): {exc}"
                 ) from exc
             raise
-        finally:
-            await _safe_close(client)
 
     @staticmethod
     def _convert_messages(messages: list[dict]) -> tuple[str, list[dict]]:
@@ -190,9 +201,3 @@ class AnthropicBackend:
     def supports_native_tools(self) -> bool:
         return True
 
-
-async def _safe_close(client) -> None:
-    try:
-        await client.close()
-    except (TypeError, AttributeError):
-        pass

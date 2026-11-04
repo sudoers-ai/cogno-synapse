@@ -53,7 +53,7 @@ class GeminiBackend:
         api_key: str | None = None,
         temperature: float | None = None,
         max_tokens: int = 4096,
-        timeout: int = 120,
+        timeout: float = 120,
     ) -> None:
         self.model = model
         self.api_key = api_key or os.getenv("GEMINI_API_KEY", "")

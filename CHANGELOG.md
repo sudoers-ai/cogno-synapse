@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.1.4 — a cloud call gives up at 30 s, retries in ONE layer, and reuses its client
+
+- **The defect, measured downstream:** a turn of 1009 s. Every backend got a 600 s timeout from
+  the factory. The SDK clients retried twice on their own UNDER the host's retry policy
+  (cogno-homeo): a hung provider held a turn for up to 600 s × 3 SDK attempts × 3 homeo attempts.
+  And every call built a new SDK client, so every call paid a new TCP + TLS handshake.
+- **The per-call timeout of a cloud backend is 30 s** (`timeouts.DEFAULT_CLOUD_TIMEOUT_S`).
+  - The factory gives it to every cloud backend. `OpenAIBackend` (and the OpenAI-compatible
+    providers), `AnthropicBackend` and `GroqBackend` default to it when built directly too;
+    `GeminiBackend` and `BedrockBackend` built directly keep their own 120 s.
+  - An explicit `timeout=` wins; otherwise `COGNO_CLOUD_TIMEOUT_S`, read per construction.
+  - Why 30 s, and the declared cost (a reply needing more than 30 s of generation is cut), are
+    written in `cogno_synapse/timeouts.py`.
+  - Ollama is not governed by it: the factory keeps giving it 600 s, because a local model on
+    CPU can take minutes.
+- **ONE retry layer.** The SDK clients are built with `max_retries=0` (OpenAI, Anthropic,
+  Groq). The retry layer is cogno-homeo's (`RetryPolicy` over `FallbackBackend`), which also
+  holds the breaker. Bedrock already had `max_attempts: 0`.
+- **The client is reused.** One SDK client per backend instance, built on the first call and
+  reused by every call after it, per event loop (`_client_cache.LoopBoundClient`). An httpx pool
+  is bound to its loop, so a new loop gets a new client.
+  - `aclose()` closes it, on each backend and on `FallbackBackend` (each link).
+  - Nothing of what the model reads changes: same request, same parameters.
+- **Not changed:** the embedders (`OpenAIEmbedder` already reused its client and has no second
+  retry layer), Gemini's client (built per call, the SDK is not installed here to test it),
+  Ollama's per-call `httpx` client.
+- **Tests:** `tests/unit/test_cloud_timeouts_retries_client.py`, against a local fake HTTP
+  server (loopback, no provider):
+  - N calls open ONE connection;
+  - a server that never answers is cut at the timeout, with ONE request received;
+  - a provider that fails is asked exactly `RetryPolicy.max_retries + 1` times;
+  - the defaults and the environment variable.
+
 ## Unreleased
 
 Documentation only — no code, test or packaging change.

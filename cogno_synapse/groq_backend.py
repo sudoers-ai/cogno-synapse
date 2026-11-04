@@ -13,9 +13,11 @@ import os
 import time
 import logging
 
+from cogno_synapse._client_cache import LoopBoundClient
 from cogno_synapse.errors import InvalidAPIKeyError
+from cogno_synapse.timeouts import SDK_MAX_RETRIES, cloud_timeout
 from cogno_synapse.tool_parsing import parse_tool_calls_from_text
-from cogno_synapse.openai_backend import _openai_tool_call, _provider_string, _safe_close
+from cogno_synapse.openai_backend import _openai_tool_call, _provider_string
 from cogno_synapse._obs import log_done, log_request, warn_if_retryable
 
 logger = logging.getLogger("cogno_synapse.groq")
@@ -37,13 +39,17 @@ class GroqBackend:
         api_key: str | None = None,
         temperature: float | None = None,
         max_tokens: int = 4096,
-        timeout: int = 60,
+        timeout: float | None = None,
     ) -> None:
         self.model = model
         self.api_key = api_key or os.getenv("GROQ_API_KEY", "")
         self.temperature = temperature
         self.max_tokens = max_tokens
-        self.timeout = timeout
+        # 30 s unless told otherwise (``cogno_synapse.timeouts``: why, and how to steer it).
+        self.timeout = timeout if timeout is not None else cloud_timeout()
+        # ONE SDK client per instance (and per event loop), reused by every call
+        # (``cogno_synapse._client_cache``).
+        self._clients = LoopBoundClient(self._new_client)
         # Groq's response is OpenAI-shaped and carries ``system_fingerprint`` too, so the same
         # question ("did the backend under this alias change between these two calls?") is
         # answerable here. None until a call runs, reset at the top of every call so a raised
@@ -54,11 +60,20 @@ class GroqBackend:
             logger.warning("GROQ_API_KEY not set — Groq calls will fail")
 
     def _client(self):
+        """This instance's SDK client — built once, reused (``LoopBoundClient``)."""
+        return self._clients.get()
+
+    async def aclose(self) -> None:
+        """Close the cached SDK client (a host calls it at shutdown)."""
+        await self._clients.aclose()
+
+    def _new_client(self):
         try:
             from groq import AsyncGroq
         except ImportError as exc:
             raise ImportError('groq not installed. Run: pip install "cogno-anima[groq]"') from exc
-        return AsyncGroq(api_key=self.api_key, timeout=self.timeout)
+        return AsyncGroq(api_key=self.api_key, timeout=self.timeout,
+                         max_retries=SDK_MAX_RETRIES)  # the ONE retry layer is the host's
 
     async def generate(self, system: str, prompt: str) -> tuple[str, int, int]:
         client = self._client()
@@ -88,8 +103,6 @@ class GroqBackend:
                 raise InvalidAPIKeyError(f"GROQ_API_KEY invalid/rejected (model={self.model}): {exc}") from exc
             warn_if_retryable(logger, "groq", self.model, exc)
             raise
-        finally:
-            await _safe_close(client)
 
     async def chat_with_tools(self, messages, tools, tool_choice=None):
         client = self._client()
@@ -119,8 +132,6 @@ class GroqBackend:
             if _is_auth_error(exc):
                 raise InvalidAPIKeyError(f"GROQ_API_KEY invalid/rejected (model={self.model}): {exc}") from exc
             raise
-        finally:
-            await _safe_close(client)
 
     def schema_dialect(self, form: str) -> None:
         """No schema travels with this provider's ``generate``: ``None`` for every form.
