@@ -20,7 +20,9 @@ import json
 import logging
 from typing import Any, Mapping, Optional
 
+from cogno_synapse._client_cache import LoopBoundClient
 from cogno_synapse.errors import InvalidAPIKeyError
+from cogno_synapse.timeouts import SDK_MAX_RETRIES, cloud_timeout
 from cogno_synapse.schema import (SCHEMA_NAME_RE, SCHEMA_REFUSED, SchemaRefusals, dialect_for,
                                   is_invalid_request, schema_digest, to_dialect)
 from cogno_synapse.tool_parsing import parse_tool_calls_from_text
@@ -152,7 +154,7 @@ class OpenAIBackend:
         api_key: str | None = None,
         temperature: float | None = None,
         max_tokens: int = 4096,
-        timeout: int = 120,
+        timeout: float | None = None,
         base_url: str | None = None,
         reasoning_effort: str | None = None,
     ) -> None:
@@ -160,7 +162,11 @@ class OpenAIBackend:
         self.api_key = api_key or os.getenv("OPENAI_API_KEY", "")
         self.temperature = temperature
         self.max_tokens = max_tokens
-        self.timeout = timeout
+        # 30 s unless told otherwise (``cogno_synapse.timeouts``: why, and how to steer it).
+        self.timeout = timeout if timeout is not None else cloud_timeout()
+        # ONE SDK client per instance (and per event loop), reused by every call: a client per
+        # call paid a new TCP+TLS handshake each time (``cogno_synapse._client_cache``).
+        self._clients = LoopBoundClient(self._new_client)
         # Reasoning budget for the o-series/gpt-5 models. Default None = SEND NOTHING and let
         # the provider apply its own default. A library-wide "low" would quietly re-tune every
         # consumer's quality/cost trade-off on upgrade — the opposite of what a transport layer
@@ -224,21 +230,31 @@ class OpenAIBackend:
         return {key: self.max_tokens}
 
     def _client(self):
+        """This instance's SDK client — built once, reused (``LoopBoundClient``)."""
+        return self._clients.get()
+
+    def _new_client(self):
         try:
             import openai
         except ImportError as exc:
             raise ImportError(
                 'openai not installed. Run: pip install "cogno-anima[openai]"'
             ) from exc
-        kwargs: dict = {"api_key": self.api_key, "timeout": self.timeout}
+        # max_retries=0: the ONE retry layer is the host's (cogno-homeo, with its breaker).
+        kwargs: dict = {"api_key": self.api_key, "timeout": self.timeout,
+                        "max_retries": SDK_MAX_RETRIES}
         if self.base_url:
             kwargs["base_url"] = self.base_url
         return openai.AsyncOpenAI(**kwargs)
 
+    async def aclose(self) -> None:
+        """Close the cached SDK client (a host calls it at shutdown)."""
+        await self._clients.aclose()
+
     async def generate(self, system: str, prompt: str) -> tuple[str, int, int]:
         result = await self._complete(system, prompt, None)
         # The receipt is written HERE, after the last suspension point of the call (``_complete``
-        # ends by awaiting the client's close), and nothing awaits between this line and the
+        # returns the provider's answer), and nothing awaits between this line and the
         # caller's next statement. Written any earlier, a structured call finishing on this same
         # instance in between would leave ITS dialect for this plain call to be read with.
         self.last_schema_dialect = None
@@ -394,8 +410,6 @@ class OpenAIBackend:
                 ) from exc
             warn_if_retryable(logger, "openai", self.model, exc)
             raise
-        finally:
-            await _safe_close(client)
 
     async def chat_with_tools(
         self, messages: list[dict], tools: list[dict], tool_choice=None,
@@ -462,8 +476,6 @@ class OpenAIBackend:
                     f"OPENAI_API_KEY invalid/rejected (model={self.model}): {exc}"
                 ) from exc
             raise
-        finally:
-            await _safe_close(client)
 
     def supports_native_tools(self) -> bool:
         return True
@@ -501,9 +513,3 @@ def _openai_tool_call(tc) -> dict:
         },
     }
 
-
-async def _safe_close(client) -> None:
-    try:
-        await client.close()
-    except (TypeError, AttributeError):
-        pass  # MagicMock in tests / no-op clients

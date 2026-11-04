@@ -43,7 +43,7 @@ class BedrockBackend:
         model: str,
         temperature: float | None = None,
         max_tokens: int = 4096,
-        timeout: int = 120,
+        timeout: float = 120,
     ) -> None:
         self.model = model
         self.temperature = temperature

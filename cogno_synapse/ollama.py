@@ -53,7 +53,7 @@ class OllamaBackend(LLMBackend):
         self,
         model: str,
         base_url: str = "http://localhost:11434",
-        timeout: Optional[int] = None,
+        timeout: Optional[float] = None,
         temperature: Optional[float] = None,
         num_ctx: Optional[int] = 8192,
         max_tokens: Optional[int] = 4096,

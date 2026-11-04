@@ -160,6 +160,7 @@ The library reads these variables (`os.environ`/`os.getenv` under `cogno_synapse
 | `AWS_DEFAULT_REGION`, `AWS_REGION` | `BedrockBackend` (the first, then the second; no default) · `BedrockEmbedder` (`AWS_REGION`, default `us-east-1`) | |
 | `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY`, `TOGETHER_API_KEY`, `FIREWORKS_API_KEY` | `create_backend` for the OpenAI-compatible prefixes | |
 | `OPENAI_REASONING_EFFORT` | `OpenAIBackend` | unset = the field is not sent |
+| `COGNO_CLOUD_TIMEOUT_S` | `create_backend` (every cloud provider), `OpenAIBackend`, `AnthropicBackend`, `GroqBackend` | seconds per call, default 30; read per construction and only when no `timeout=` is passed; not a positive number → 30 (`cogno_synapse/timeouts.py`) |
 | `COGNO_OLLAMA_TIMEOUT` | `OllamaBackend`, `OllamaEmbedder` | seconds, default 120; read per construction and only when no `timeout=` is passed — `create_backend` passes 600 and `create_embedder` 120, so through the factories it does not apply; a bad value logs `event=bad_timeout_env` and falls back to 120 |
 
 A cloud key that is empty, `dummy`, or contains `sk-proj-*` counts as missing for the factories, which then raise `MissingAPIKeyError` unless `api_key=` is passed. A backend constructed directly without its key does not raise: it logs a WARNING at construction, and the failure arrives on the first call.

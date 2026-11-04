@@ -64,6 +64,11 @@ def _key_present(provider: str) -> bool:
     return bool(val) and val.lower() != "dummy" and "sk-proj-*" not in val
 
 
+#: What the factory has always given an Ollama backend: a local model on CPU can take minutes
+#: for one generation, so the 30 s cloud timeout does not apply to it.
+_OLLAMA_FACTORY_TIMEOUT_S = 600
+
+
 def create_backend(
     model_string: str,
     *,
@@ -72,9 +77,14 @@ def create_backend(
     temperature: float | None = None,
     num_ctx: int | None = 8192,
     max_tokens: int = 4096,
-    timeout: int = 600,
+    timeout: float | None = None,
 ) -> LLMBackend:
     """Instantiate a single backend for ``model_string`` (e.g. "openai:gpt-4o-mini").
+
+    ``timeout`` is per CALL. ``None`` → a cloud backend takes ``timeouts.cloud_timeout()`` (30 s,
+    ``COGNO_CLOUD_TIMEOUT_S``), and Ollama keeps the 600 s it always got here (a local model on
+    CPU can take minutes). Until 0.1.4 every backend got 600 s; ``cogno_synapse.timeouts`` says
+    why that changed.
 
     ``api_key`` overrides the env-var lookup — the host passes a per-tenant key (BYOK);
     when None the provider falls back to its env var. Raises ``MissingAPIKeyError`` if a
@@ -88,35 +98,39 @@ def create_backend(
             f"Model '{model_string}' needs {_key_env(provider)} or an explicit api_key."
         )
 
+    from cogno_synapse.timeouts import cloud_timeout
+    cloud = timeout if timeout is not None else cloud_timeout()
+
     if provider in _OPENAI_COMPATIBLE:
         url, env = _OPENAI_COMPATIBLE[provider]
         from cogno_synapse.openai_backend import OpenAIBackend
         return OpenAIBackend(model=model, api_key=api_key or os.environ.get(env), base_url=url,
-                             temperature=temperature, max_tokens=max_tokens, timeout=timeout)
+                             temperature=temperature, max_tokens=max_tokens, timeout=cloud)
 
     if provider == "openai":
         from cogno_synapse.openai_backend import OpenAIBackend
         return OpenAIBackend(model=model, api_key=api_key, temperature=temperature,
-                             max_tokens=max_tokens, timeout=timeout)
+                             max_tokens=max_tokens, timeout=cloud)
     if provider == "anthropic":
         from cogno_synapse.anthropic_backend import AnthropicBackend
         return AnthropicBackend(model=model, api_key=api_key, temperature=temperature,
-                                max_tokens=max_tokens, timeout=timeout)
+                                max_tokens=max_tokens, timeout=cloud)
     if provider == "groq":
         from cogno_synapse.groq_backend import GroqBackend
         return GroqBackend(model=model, api_key=api_key, temperature=temperature,
-                           max_tokens=max_tokens, timeout=timeout)
+                           max_tokens=max_tokens, timeout=cloud)
     if provider == "gemini":
         from cogno_synapse.gemini_backend import GeminiBackend
         return GeminiBackend(model=model, api_key=api_key, temperature=temperature,
-                             max_tokens=max_tokens, timeout=timeout)
+                             max_tokens=max_tokens, timeout=cloud)
     if provider == "bedrock":
         from cogno_synapse.bedrock_backend import BedrockBackend
-        return BedrockBackend(model=model, temperature=temperature, max_tokens=max_tokens, timeout=timeout)
+        return BedrockBackend(model=model, temperature=temperature, max_tokens=max_tokens, timeout=cloud)
 
     from cogno_synapse.ollama import OllamaBackend
     return OllamaBackend(model=model, base_url=base_url, temperature=temperature,
-                         num_ctx=num_ctx, max_tokens=max_tokens, timeout=timeout)
+                         num_ctx=num_ctx, max_tokens=max_tokens,
+                         timeout=timeout if timeout is not None else _OLLAMA_FACTORY_TIMEOUT_S)
 
 
 def create_embedder(

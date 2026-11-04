@@ -53,10 +53,18 @@ clobber Ollama's `mistral:latest`; `create_backend("mistral:latest")` resolves t
 Ollama. `OllamaBackend` itself is a plain `LLMBackend` (it has no
 `chat_with_tools`), which is why it takes the text-fallback path below.
 
-**Timeouts.** `create_backend` passes `timeout=600` and `create_embedder`
-`timeout=120` unless told otherwise. `$COGNO_OLLAMA_TIMEOUT` (default 120 s) is
-read only by an `OllamaBackend`/`OllamaEmbedder` built WITHOUT a `timeout=`, so
-it does not reach one built through the factories.
+**Timeouts.** `create_backend` gives a CLOUD backend 30 s per call
+(`timeouts.cloud_timeout()`: `$COGNO_CLOUD_TIMEOUT_S`, default 30) and an Ollama
+backend 600 s, unless told otherwise; `create_embedder` passes `timeout=120`.
+`$COGNO_OLLAMA_TIMEOUT` (default 120 s) is read only by an
+`OllamaBackend`/`OllamaEmbedder` built WITHOUT a `timeout=`, so it does not reach
+one built through the factories. Why 30 s, and its cost, are written in
+`cogno_synapse/timeouts.py`.
+
+**Retries and clients.** The cloud SDK clients never retry (`max_retries=0`): the
+ONE retry layer is the host's `RetryPolicy` over `FallbackBackend` (cogno-homeo,
+with its breaker). Each backend instance builds its SDK client once and reuses it
+(per event loop); `aclose()` on a backend or on a `FallbackBackend` closes it.
 
 Install only the SDKs you use:
 

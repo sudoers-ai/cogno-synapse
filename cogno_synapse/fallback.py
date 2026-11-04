@@ -64,6 +64,13 @@ class FallbackBackend:
             breaker=self._breaker, policy=self._policy, metrics=self._metrics,
         )
 
+    async def aclose(self) -> None:
+        """Close every link's cached client (``aclose`` where a link has one)."""
+        for b in self.backends:
+            close = getattr(b, "aclose", None)
+            if close is not None:
+                await close()
+
     def schema_dialect(self, form: str) -> Optional[str]:
         """``"chain"`` when AT LEAST ONE link answers this ``form``; ``None`` when none does.
 
