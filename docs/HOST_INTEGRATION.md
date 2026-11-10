@@ -63,8 +63,11 @@ one built through the factories. Why 30 s, and its cost, are written in
 
 **Retries and clients.** The cloud SDK clients never retry (`max_retries=0`): the
 ONE retry layer is the host's `RetryPolicy` over `FallbackBackend` (cogno-homeo,
-with its breaker). Each backend instance builds its SDK client once and reuses it
-(per event loop); `aclose()` on a backend or on a `FallbackBackend` closes it.
+with its breaker). Each backend instance builds its client once and reuses it
+(per event loop) — a cloud backend's SDK client and, since 0.1.5, the `httpx`
+client of `OllamaBackend` and `OllamaEmbedder` and the genai client of
+`GeminiBackend`; `aclose()` on a backend, an embedder or a `FallbackBackend`
+closes it.
 
 Install only the SDKs you use:
 
