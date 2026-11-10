@@ -9,6 +9,7 @@ from typing import Any, Mapping, Optional, Union
 import httpx
 
 from cogno_synapse.base import LLMBackend, Embedder
+from cogno_synapse._client_cache import LoopBoundClient
 from cogno_synapse.schema import (SCHEMA_REFUSED, SchemaRefusals, dialect_for, is_invalid_request,
                                   schema_digest, to_dialect)
 from cogno_synapse._math import cosine_similarity
@@ -77,12 +78,29 @@ class OllamaBackend(LLMBackend):
         # is the right default; it is a harmless no-op on non-reasoning models.
         self.think = think
         self._endpoint = f"{self.base_url}/api/generate"
+        # ONE httpx client per instance (and per event loop), reused by every call: a client
+        # per call paid a new TCP handshake each time (``cogno_synapse._client_cache``). The
+        # default timeout is this instance's; a call that needs a different one (``is_available``,
+        # 3 s) overrides it per request, so the request a provider sees is byte-for-byte the one
+        # it saw before.
+        self._clients = LoopBoundClient(self._new_client)
         # The RECEIPT of the last call's schema — a dialect (it travelled), "refused" (asked for,
         # did not travel) or None (no schema). Written at the END of every call. Read it through
         # ``cogno_synapse.schema_applied_of``, immediately after the await.
         self.last_schema_dialect: Optional[str] = None
         # What THIS instance remembers about schemas the server refused (fifteen minutes).
         self._schema_refusals = SchemaRefusals()
+
+    def _new_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(timeout=self.timeout)
+
+    def _client(self) -> httpx.AsyncClient:
+        """This instance's httpx client — built once, reused (``LoopBoundClient``)."""
+        return self._clients.get()
+
+    async def aclose(self) -> None:
+        """Close the cached httpx client (a host calls it at shutdown)."""
+        await self._clients.aclose()
 
     async def generate(self, system: str, prompt: str) -> tuple[str, int, int]:
         return await self._post(system, prompt, self.format)
@@ -165,8 +183,7 @@ class OllamaBackend(LLMBackend):
 
         log_request(logger, "ollama", self.model, system, prompt)
         t0 = time.perf_counter()
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(self._endpoint, json=payload)
+        response = await self._client().post(self._endpoint, json=payload)
 
         try:
             response.raise_for_status()
@@ -192,8 +209,10 @@ class OllamaBackend(LLMBackend):
 
     async def is_available(self) -> bool:
         try:
-            async with httpx.AsyncClient(timeout=3) as client:
-                await client.get(f"{self.base_url}/api/tags")
+            # The reused client, but with this probe's own 3 s timeout per request (the pool
+            # default is the instance timeout). Behaviour is identical to the old per-call
+            # ``httpx.AsyncClient(timeout=3)``.
+            await self._client().get(f"{self.base_url}/api/tags", timeout=3)
             return True
         except Exception:
             return False
@@ -248,11 +267,25 @@ class OllamaEmbedder(Embedder):
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout if timeout is not None else default_timeout()
+        # ONE httpx client per instance (and per event loop), reused by every embed call: a
+        # client per call paid a new TCP handshake each time (``cogno_synapse._client_cache``).
+        self._clients = LoopBoundClient(self._new_client)
         # Learned once per instance: an Ollama too old for ``/api/embed`` answers 404 to EVERY
         # call, and this client is used several times per turn. Rediscovering it each time buys
         # nothing and costs a failed round trip per embedding. Same shape as the OpenAI
         # backend's ``_tools_need_effort_none``.
         self._legacy_only = False
+
+    def _new_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(timeout=self.timeout)
+
+    def _client(self) -> httpx.AsyncClient:
+        """This instance's httpx client — built once, reused (``LoopBoundClient``)."""
+        return self._clients.get()
+
+    async def aclose(self) -> None:
+        """Close the cached httpx client (a host calls it at shutdown)."""
+        await self._clients.aclose()
 
     async def embed(self, text: str) -> list[float]:
         vec, _ = await self.embed_with_usage(text)
@@ -269,9 +302,8 @@ class OllamaEmbedder(Embedder):
             return [], 0
 
         if not self._legacy_only:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.post(f"{self.base_url}/api/embed",
-                                         json={"model": self.model, "input": text})
+            resp = await self._client().post(f"{self.base_url}/api/embed",
+                                             json={"model": self.model, "input": text})
             # 404/405 = this server does not have the endpoint. Anything else is a real error
             # (a bad model name, an overloaded box) and must propagate, exactly as before —
             # falling back on those would hide a broken deployment behind a silent 0.
@@ -292,9 +324,8 @@ class OllamaEmbedder(Embedder):
                 "which reports NO token count, so embedding usage will meter as 0 for this "
                 "deployment. Upgrade Ollama to bill embeddings.", self.base_url)
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(f"{self.base_url}/api/embeddings",
-                                     json={"model": self.model, "prompt": text})
+        resp = await self._client().post(f"{self.base_url}/api/embeddings",
+                                         json={"model": self.model, "prompt": text})
         resp.raise_for_status()
         data = resp.json()
         # SINGULAR here — the legacy shape. And no count: measured against a live Ollama

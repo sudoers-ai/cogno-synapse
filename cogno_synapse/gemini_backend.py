@@ -15,6 +15,7 @@ import json
 import time
 import logging
 
+from cogno_synapse._client_cache import LoopBoundClient
 from cogno_synapse.errors import InvalidAPIKeyError
 from cogno_synapse.tool_parsing import parse_tool_calls_from_text
 from cogno_synapse._obs import log_done, log_request, warn_if_retryable
@@ -60,10 +61,13 @@ class GeminiBackend:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.timeout = timeout
+        # ONE genai client per instance (and per event loop), reused by every call: a client per
+        # call built a fresh connection pool each time (``cogno_synapse._client_cache``).
+        self._clients = LoopBoundClient(self._new_client)
         if not self.api_key:
             logger.warning("GEMINI_API_KEY not set — Gemini calls will fail")
 
-    def _client(self):
+    def _new_client(self):
         try:
             from google import genai
         except ImportError as exc:
@@ -71,6 +75,14 @@ class GeminiBackend:
                 'google-genai not installed. Run: pip install "cogno-anima[gemini]"'
             ) from exc
         return genai.Client(api_key=self.api_key)
+
+    def _client(self):
+        """This instance's genai client — built once, reused (``LoopBoundClient``)."""
+        return self._clients.get()
+
+    async def aclose(self) -> None:
+        """Close the cached genai client (a host calls it at shutdown)."""
+        await self._clients.aclose()
 
     async def generate(self, system: str, prompt: str) -> tuple[str, int, int]:
         client = self._client()
@@ -99,13 +111,12 @@ class GeminiBackend:
 
     async def chat_with_tools(self, messages, tools, tool_choice=None):
         try:
-            from google import genai
             from google.genai import types
         except ImportError as exc:
             raise ImportError(
                 'google-genai not installed. Run: pip install "cogno-anima[gemini]"'
             ) from exc
-        client = genai.Client(api_key=self.api_key)
+        client = self._client()
 
         decls = [types.FunctionDeclaration(
             name=t.get("function", {}).get("name", ""),
