@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.1.5 — Ollama and Gemini reuse their HTTP client too
+
+- **The defect:** 0.1.4 reused ONE client per backend instance for OpenAI/Anthropic/Groq, but
+  left two backends building a fresh client on every call — the handshake tax it had just
+  removed, still paid by the two it did not reach:
+  - `OllamaBackend` and `OllamaEmbedder` opened an `async with httpx.AsyncClient(...)` on every
+    `/api/generate`, `/api/embed`, `/api/embeddings` and `/api/tags` call;
+  - `GeminiBackend` built a fresh `genai.Client(...)` in `generate` and again in
+    `chat_with_tools`.
+- **Both now reuse one client per instance (and per event loop)** via the same
+  `_client_cache.LoopBoundClient` the cloud backends use. The client is built on the first call
+  and reused by every call after it; a new event loop gets a new client (an httpx pool is bound
+  to its loop). Each gained an `aclose()` a host calls at shutdown.
+- **Nothing the provider sees changes:** same endpoints, same payloads, same timeouts. The
+  Ollama `is_available` probe keeps its own 3 s by overriding it per request, rather than owning
+  a second client.
+- **`LoopBoundClient.aclose()` now closes whichever closer the client offers** — `aclose()` for a
+  raw `httpx.AsyncClient`, `close()` for the SDK clients — so the one cache serves both without
+  leaking the httpx pool. The SDK backends' behaviour is unchanged (they have `close()` only).
+- **The pin bump in the consumers (cogno-anima, the host) is a follow-up** — this release only
+  touches `cogno-synapse`.
+- **Tests:** `tests/unit/test_ollama_gemini_client_reuse.py` (fake client, no network): N calls
+  build ONE client; `aclose` closes the cached one and the next call rebuilds; `is_available`
+  reuses the client and keeps its 3 s; a new event loop gets a new client; Gemini builds and
+  reuses one `genai.Client` (fake SDK module).
+
 ## 0.1.4 — a cloud call gives up at 30 s, retries in ONE layer, and reuses its client
 
 - **The defect, measured downstream:** a turn of 1009 s. Every backend got a 600 s timeout from

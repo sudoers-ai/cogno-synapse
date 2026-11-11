@@ -44,7 +44,14 @@ class LoopBoundClient:
         client, self._client, self._loop = self._client, None, None
         if client is None:
             return
+        # The SDK clients (``AsyncOpenAI``, ``AsyncAnthropic``, ``AsyncGroq``) close with
+        # ``close()``; a raw ``httpx.AsyncClient`` (the Ollama backend's reused client) closes
+        # with ``aclose()`` and has no ``close()``. Take whichever this client offers, so one
+        # cache serves both without leaking the httpx pool.
+        closer = getattr(client, "aclose", None) or getattr(client, "close", None)
+        if closer is None:
+            return
         try:
-            await client.close()
+            await closer()
         except (TypeError, AttributeError):
             pass  # a test double without an async close
